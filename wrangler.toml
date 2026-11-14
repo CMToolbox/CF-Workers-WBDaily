@@ -1,0 +1,24 @@
+# Cloudflare Worker 配置：单 Worker + 静态资源 + 1 个 KV Namespace + 1 条 Cron
+name = "cf-workers-wbdaily"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# 静态前端（零构建）。not_found_handling 必须是 none：
+# 未命中文件时把请求交回 Worker，避免 POST /api/* 拿到 200 HTML。
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "none"
+
+# 唯一 KV binding。部署前把 id 换成 `wrangler kv namespace create WB_KV` 的输出。
+[[kv_namespaces]]
+binding = "WB_KV"
+id = "REPLACE_WITH_YOUR_KV_ID"
+
+# 每日 01:00 UTC（= 09:00 Asia/Shanghai）
+[triggers]
+crons = ["0 1 * * *"]
+
+[vars]
+# 免费版单请求 CPU 上限 10ms，PBKDF2 迭代必须压低，否则登录会 1102。
+PBKDF2_ITERATIONS = "30000"
