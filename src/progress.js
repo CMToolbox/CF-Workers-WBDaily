@@ -15,17 +15,22 @@ import { isoNow } from './util.js';
 
 /**
  * 把本次 run 的成功结果合并进当日进度。
+ *
+ * 北京日期由调用方决定：cron 分支用 scheduledTime 推导（跨零点 / 实例冷启动延迟时，
+ * 「这一轮属于哪一天」必须以触发时刻为准，否则会跟 isDayComplete 的日期口径打架）；
+ * 手动 / MCP 入口不传，回落到「现在」的北京日期。
  * @param {object} ctx
  * @param {object[]} entries runCheckin 的 entries（含 accountId / result）
+ * @param {string} [date] 北京日期 YYYY-MM-DD；缺省时用 ctx.now() 推导
  * @returns {Promise<object|null>} 合并后的记录；无成功项、无变化或写失败时返回 null
  */
-export async function recordProgress(ctx, entries) {
+export async function recordProgress(ctx, entries, date = null) {
   if (!Array.isArray(entries) || entries.length === 0) return null;
   try {
     const nowMs = typeof ctx.now === 'function' ? ctx.now() : 0;
-    const { date } = beijingParts(nowMs);
-    const day = await ctx.kv.getCheckinDay();
-    const merged = mergeDayRecord(day, date, entries, isoNow(nowMs));
+    const beijingDate = typeof date === 'string' && date ? date : beijingParts(nowMs).date;
+    const record = await ctx.kv.getCheckinDay();
+    const merged = mergeDayRecord(record, beijingDate, entries, isoNow(nowMs));
     if (!merged) return null;
     await ctx.kv.putCheckinDay(merged);
     return merged;

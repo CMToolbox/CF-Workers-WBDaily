@@ -390,7 +390,11 @@ function tokenState(account) {
 }
 
 /**
- * 账号状态徽标：禁用 > token 失效 > 最近一次 run 的结果。
+ * 账号状态徽标：禁用 > token 失效 > 「今天」最近一次 run 的结果。
+ *
+ * ⚠ 必须按北京日期过滤：run 的 result 只对**它发生的那一天**有效。
+ * 昨晚 23:xx 手动测试返回 already_checked_in，若直接拿来渲染，今天凌晨又没跑过时
+ * 卡片会一直显示「今日已签」，与 KPI「今天还没有执行记录」自相矛盾。
  * @param {object} account
  * @returns {HTMLElement}
  */
@@ -400,8 +404,10 @@ function statusBadge(account) {
   if (entry && entry.error && entry.error.tokenInvalid === true) {
     return el('span', 'badge badge-bad', 'token 失效');
   }
-  const latest = latestRunFor(account.id);
-  return resultBadge(latest ? latest.result : null);
+  const today = latestRunTodayFor(account.id);
+  if (today) return resultBadge(today.result);
+  // 今天还没有该账号的执行记录：跑过（哪怕只是昨天）就是中性「未签到」，完全没跑过仍是「未跑过」
+  return latestRunFor(account.id) ? el('span', 'badge badge-mute', '未签到') : resultBadge(null);
 }
 
 /**
@@ -696,6 +702,26 @@ function latestRunToday() {
 }
 
 /**
+ * 最近一次命中该账号、且 startedAt 落在今天（Asia/Shanghai）的 run。
+ * 与 latestRunFor 的唯一差别就是这条日期过滤：跨天的旧结果不能代表今天。
+ * @param {string} accountId
+ * @returns {{result:string, startedAt:string}|null}
+ */
+function latestRunTodayFor(accountId) {
+  const today = fmtDateStamp();
+  for (const run of state.logs) {
+    if (!run || !run.startedAt) continue;
+    const date = new Date(run.startedAt);
+    if (Number.isNaN(date.getTime())) continue;
+    if (fmtDateStamp(date) !== today) continue;
+    const results = Array.isArray(run.accountResults) ? run.accountResults : [];
+    const hit = results.find((item) => item && item.accountId === accountId);
+    if (hit) return { result: hit.result || 'failed', startedAt: run.startedAt };
+  }
+  return null;
+}
+
+/**
  * 启用账号里最早的签到小时（用于「下次自动签到」）。
  * @returns {number|null}
  */
@@ -705,6 +731,33 @@ function nextCheckinHour() {
     .map((account) => (Number.isInteger(account.checkinHour) ? account.checkinHour : 8));
   if (hours.length === 0) return null;
   return Math.min(...hours);
+}
+
+/**
+ * 当前北京时间的「当天第几分钟」（0~1439）。
+ * 复用 CLOCK_FMT（Asia/Shanghai）避免新引入时区字符串；取模 24 兜住 ICU 的 24:00 写法。
+ * @param {Date} [date]
+ * @returns {number}
+ */
+function beijingMinuteOfDay(date = new Date()) {
+  const [hh, mm] = CLOCK_FMT.format(date).split(':');
+  const hour = Number(hh) % 24;
+  const minute = Number(mm);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return 0;
+  return hour * 60 + minute;
+}
+
+/**
+ * 「下次自动签到」：启用账号里最早的签到小时，外加「今天还是明天」。
+ * 只有该时刻**严格晚于**当前北京分钟数才算今天（08:00 时 08:00 这轮已经在跑），
+ * 否则顺延到明天——凌晨 02:00 时显示「08:00（今天）」而不是「08:00 明天」。
+ * @returns {{hour:number, isTomorrow:boolean}|null}
+ */
+function nextCheckinInfo() {
+  const hour = nextCheckinHour();
+  if (hour === null) return null;
+  const normalized = ((Number(hour) % 24) + 24) % 24;
+  return { hour, isTomorrow: normalized * 60 <= beijingMinuteOfDay() };
 }
 
 /**
@@ -794,13 +847,14 @@ function renderKpis() {
       : (creditReady === 0 ? '尚未查询额度' : `${creditReady} / ${accounts.length} 个已查询`);
   }
 
-  // 4. 下次自动签到（启用账号里最早的 checkinHour）
-  const hour = nextCheckinHour();
+  // 4. 下次自动签到（启用账号里最早的 checkinHour；已过点则顺延到明天）
+  const nextInfo = nextCheckinInfo();
+  const hour = nextInfo ? nextInfo.hour : null;
   const nextNode = $('#kpi-next');
   const nextSub = $('#kpi-next-sub');
   if (nextNode) {
     nextNode.textContent = hour === null ? '—' : fmtHour(hour);
-    if (hour !== null) nextNode.appendChild(el('small', null, '明天'));
+    if (hour !== null && nextInfo.isTomorrow) nextNode.appendChild(el('small', null, '明天'));
   }
   if (nextSub) nextSub.textContent = hour === null ? '没有启用账号' : '北京时间 · Cron 每小时扫描';
 
@@ -1183,8 +1237,7 @@ function accountDetail(account) {
   wrap.appendChild(creditBlock(account, entry));
 
   const foot = el('div', 'detail-foot');
-  const data = entry && entry.data ? entry.data : null;
-  if (data && data.switchAt) foot.appendChild(el('span', null, `积分切换时间 ${fmtDateTime(data.switchAt)}`));
+  // switchAt（积分切换时间）属于 cockpit tools 的字段，签到面板不展示
   const token = tokenState(account);
   foot.appendChild(el('span', null, `Token ${token.text}`));
 
@@ -1275,9 +1328,7 @@ function creditBlock(account, entry) {
     for (const group of groups) wrap.appendChild(creditGroupRow(group));
   }
 
-  if (data.switchAt) {
-    wrap.appendChild(el('div', 'credit-switch', `切换时间：${fmtDateTime(data.switchAt)}`));
-  }
+  // data.switchAt（积分切换时间）只有 cockpit tools 用，签到面板不展示
   return wrap;
 }
 

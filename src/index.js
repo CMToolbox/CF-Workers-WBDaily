@@ -169,8 +169,9 @@ export default {
       const pending = pendingAccountIds(due, day, date);
       const result = await runCheckin(ctx, { trigger: 'cron', accountIds: pending });
 
-      // 只把成功结果写进当日进度：失败不写，后续几轮才会重试
-      const recorded = await recordProgress(ctx, result.entries);
+      // 只把成功结果写进当日进度：失败不写，后续几轮才会重试。
+      // 日期用上面由 scheduledTime 推导的 date，保证与 isDayComplete 是同一天口径。
+      const recorded = await recordProgress(ctx, result.entries, date);
 
       logEvent('info', 'cron_run_finished', {
         runId: result.runId,

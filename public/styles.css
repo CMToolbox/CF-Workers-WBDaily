@@ -1142,8 +1142,6 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   font-weight: 600;
 }
 
-.credit-switch { font-size: 10.5px; color: var(--muted); margin-top: 6px; }
-
 /* ============ 7. 日志页 ============ */
 
 .logs {
@@ -1417,6 +1415,39 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   .section-head .right { width: auto; margin-left: auto; justify-content: flex-end; }
 
   .log-head { grid-template-columns: 80px 74px minmax(0, 1fr) 16px; gap: 8px; }
+}
+
+/* ---- 701~900：侧栏横排成第一行（品牌 + 导航），顶栏落到第二行 ----
+   用户要求「刷新 / 主题 / 登出」在第一行最右上角，所以把它们抽出顶栏、浮到 .shell 上。
+   为什么必须同时解掉 .topbar 的「包含块」身份：
+   桌面端 .topbar 是 position: sticky，而 sticky 本身就是「已定位元素」，会成为绝对定位
+   后代的包含块；更隐蔽的是它还有 backdrop-filter（玻璃底），filter/backdrop-filter
+   不论 position 是什么都会创建包含块。只给 .top-right 加 absolute 的话，它的 top/right
+   是相对第二行的顶栏算的——上一版补丁就是这样只把图标挪到第二行右边缘、实测无效。
+   所以这里把 .topbar 降为 static 并关掉 backdrop-filter（不 sticky 就没有内容从下面穿过，
+   玻璃底本来也没意义），包含块回落到 .shell（已 position: relative），图标才落到第一行。
+   手机（≤700）不走这套——那时侧栏已经变成底部 Tab Bar；≥901 也不走（左侧栏布局）。 */
+@media (min-width: 701px) and (max-width: 900px) {
+  .shell { position: relative; }
+  .topbar {
+    position: static;
+    background: var(--panel);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  /* 第一行高 52px（8px 内边距 + 35px 导航项 + 1px 下边框），图标浮层同高并垂直居中 */
+  .top-right {
+    position: absolute;
+    top: 0;
+    right: 10px;
+    height: 52px;
+    align-items: center;
+    margin-left: 0;
+    z-index: 5;
+  }
+  /* 侧栏是横向滚动行：右侧留出图标宽度（3×32px + 间距 + 内边距 ≈ 148px），
+     否则导航项会被浮层压住 / 盖住 */
+  .sidebar { min-height: 52px; padding-right: 148px; }
 }
 
 /* ---- 700：底部 Tab Bar + 精简顶栏 + 卡片单列 ---- */
