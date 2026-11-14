@@ -422,6 +422,13 @@ code {
 .btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-2); }
+.btn-ghost:hover:not(:disabled) { background: var(--panel-2); color: var(--text); border-color: transparent; }
+
+/* ⚠ .btn-primary 必须排在 .btn-ghost 之后：两者同为单类选择器特异性，
+   排在 ghost 前面时 `btn btn-ghost … btn-primary` 组合（如列表展开区的「测试签到」）
+   会被 ghost 的 background: transparent / color: var(--text-2) 覆盖，
+   实心主按钮退化成 ghost。hover 规则同理（同为 :hover:not(:disabled) 特异性）。 */
 .btn-primary {
   background: var(--primary);
   border-color: var(--primary);
@@ -429,9 +436,6 @@ code {
   font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
-
-.btn-ghost { background: transparent; border-color: transparent; color: var(--text-2); }
-.btn-ghost:hover:not(:disabled) { background: var(--panel-2); color: var(--text); border-color: transparent; }
 
 .btn-icon { width: 32px; padding: 0; }
 .btn-sm { height: 27px; padding: 0 8px; font-size: 12px; }
@@ -845,13 +849,13 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 .acc-cell { display: flex; align-items: center; gap: 9px; min-width: 0; }
 
 .avatar {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   flex: none;
   display: grid;
   place-items: center;
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 650;
   background: var(--panel-3);
   color: var(--text-2);
@@ -900,6 +904,35 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 
 .plan.pro { color: var(--primary-text); border-color: var(--primary-ring); background: var(--primary-soft); }
 
+/* 状态徽章（方案 A）：轻量胶囊 —— 小圆点 + 文字 + soft 底色 + inset 描边，替代原描边徽标。
+   statusBadge 产出的 badge badge-* 类名被 frontend-badge-schedule.test.mjs 锁定，
+   所以只在账号页作用域（卡片头 / 列表行）内重皮，不影响日志页的 .badge。 */
+.acc-card-head .badge,
+.t-row .badge {
+  gap: 6px;
+  height: auto;
+  padding: 3.5px 11px 3.5px 9px;
+  border: 0;
+  border-radius: 99px;
+}
+
+.acc-card-head .badge::before,
+.t-row .badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+  flex: none;
+}
+
+.acc-card-head .badge-ok, .t-row .badge-ok { box-shadow: inset 0 0 0 1px var(--ok-line); }
+.acc-card-head .badge-warn, .t-row .badge-warn { box-shadow: inset 0 0 0 1px var(--warn-line); }
+.acc-card-head .badge-bad, .t-row .badge-bad { box-shadow: inset 0 0 0 1px var(--danger-line); }
+.acc-card-head .badge-info, .t-row .badge-info { box-shadow: inset 0 0 0 1px var(--info-line); }
+.acc-card-head .badge-mute, .t-row .badge-mute { box-shadow: inset 0 0 0 1px var(--border); }
+
 .money {
   font-size: 13px;
   font-weight: 600;
@@ -937,34 +970,47 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 .row-chev:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; border-radius: 4px; }
 .t-row.is-open .row-chev { transform: rotate(90deg); }
 
-/* 展开明细 */
+/* 展开明细（方案 A）：左 Hero 用量面板（1.35fr） + 右信息列（1fr） */
 .detail {
   border-bottom: 1px solid var(--grid-line);
   background: var(--panel-2);
-  box-shadow: inset 2px 0 0 var(--primary);
-  padding: 12px 14px 14px 49px;
+  padding: 4px 14px 16px;
 }
 
-.detail .credit-block { border-top: 0; padding-top: 0; }
+.detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
 
-.detail-foot {
+.detail-side {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  padding: 4px 0;
+  min-width: 0;
+}
+
+.detail-side .acc-line .k { width: 58px; }
+
+.detail-actions {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: 8px;
-  padding-top: 9px;
-  border-top: 1px dashed var(--border);
-  font-size: 11.5px;
-  color: var(--muted);
+  gap: 8px;
+  margin-top: 6px;
 }
 
-.detail-foot .grow { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+.detail-actions .btn {
+  flex: 0 0 auto;
+  height: 29px;
+  padding: 0 13px;
+  font-size: 11.5px;
+}
 
 /* ---- 卡片视图 ---- */
 .acc-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
   gap: 10px;
 }
 
@@ -989,7 +1035,26 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   padding: 12px 13px 10px;
 }
 
-.acc-card-head .btn-icon { width: 26px; height: 26px; }
+/* 头部图标按钮（方案 A）：无边框、hover 浮出 panel-2 底（与设计稿 .icon-btn 同语义） */
+.acc-card-head .btn-icon {
+  width: 27px;
+  height: 27px;
+  border-radius: 7px;
+  color: var(--muted);
+}
+.acc-card-head .btn-icon:hover:not(:disabled) { color: var(--text); }
+/* 删除按钮 hover 用 danger 红（底色由 .btn-danger-ghost 的 hover 给 danger-soft） */
+.acc-card-head .btn-danger-ghost:hover:not(:disabled) { color: var(--danger); }
+
+/* 卡片头像放大到 34px + 渐变底；列表行保持基础 28px */
+.acc-card-head .avatar {
+  width: 34px;
+  height: 34px;
+  font-size: 14px;
+  border-radius: 9px;
+  background: linear-gradient(145deg, var(--panel-3), var(--panel-2));
+}
+
 .acc-card-head .spacer { margin-left: auto; display: flex; align-items: center; gap: 4px; flex: none; }
 
 .acc-card-b {
@@ -999,16 +1064,25 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   flex-direction: column;
 }
 
+/* meta 两列网格：UID / Token / 签到时间 / 上次签到（方案 A 紧凑双列） */
+.acc-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px 18px;
+  padding: 12px 0 4px;
+  min-width: 0;
+}
+
 .acc-line {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 0;
+  gap: 7px;
+  padding: 0;
   font-size: 11.5px;
-  border-top: 1px solid var(--grid-line);
+  min-width: 0;
 }
 
-.acc-line .k { color: var(--muted); width: 58px; flex: none; }
+.acc-line .k { color: var(--muted); flex: none; width: 52px; }
 
 .acc-line .v {
   color: var(--text-2);
@@ -1020,37 +1094,68 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 
 .acc-line .v.mono { font-family: var(--mono); font-size: 10.5px; }
 .acc-line .v.bad { color: var(--danger); }
-.acc-line .acc-hour-select { margin-left: auto; }
+.acc-line .v.good { color: var(--ok); }
+.acc-line .v.warn-t { color: var(--warn); }
+
+/* UID 复制按钮：hover / 键盘聚焦时浮出（触屏没有 hover，靠 focus-visible 兜底常显） */
+.acc-line .copy {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transition: opacity var(--dur), background var(--dur), color var(--dur);
+}
+
+.acc-line:hover .copy,
+.acc-line .copy:focus-visible { opacity: 1; }
+.acc-line .copy:hover { color: var(--text); background: var(--panel-3); }
+.acc-line .copy:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.acc-line .copy svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 
 .acc-card-foot {
   display: flex;
+  gap: 8px;
+  padding: 12px 13px 14px;
   border-top: 1px solid var(--grid-line);
-  margin-top: 2px;
+  margin-top: 8px;
 }
 
 .acc-card-foot .btn {
   flex: 1;
   min-width: 0;
-  height: 33px;
-  padding: 0;
-  border: 0;
-  border-right: 1px solid var(--grid-line);
-  border-radius: 0;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 11.5px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--r-md);
+  font-size: 12px;
 }
 
-.acc-card-foot .btn:last-child { border-right: 0; }
-.acc-card-foot .btn:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
-
-/* ---- 积分配额（卡片与明细共用） ---- */
+/* ---- 积分 Hero 面板（方案 A 视觉核心，卡片与列表明细共用） ---- */
 .credit-block {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 10px 0 8px;
-  border-top: 1px solid var(--grid-line);
+  padding: 13px 15px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(120% 180% at 100% 0%, var(--primary-soft), transparent 55%),
+    var(--panel-2);
   min-width: 0;
 }
 
@@ -1070,69 +1175,129 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   padding: 6px 8px;
 }
 
-.usage-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.usage-label { color: var(--muted); font-size: 11.5px; }
-.usage-value { font-size: 11.5px; font-weight: 600; }
-.usage-value.is-ok { color: var(--ok); }
-.usage-value.is-warn { color: var(--warn); }
-
-.credit-total {
+.hero-top {
   display: flex;
   align-items: baseline;
-  gap: 6px;
-  margin-top: 2px;
+  justify-content: space-between;
+  gap: 10px;
 }
 
-.credit-total-label { font-size: 11.5px; color: var(--muted); }
+.hero-label {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
 
-.credit-total-value {
-  margin-left: auto;
-  font-size: 20px;
-  font-weight: 640;
-  letter-spacing: -.025em;
+.hero-live {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 5px var(--primary);
+  flex: none;
+}
+
+.hero-num {
+  font-family: var(--mono);
+  font-size: 27px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  color: var(--text);
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.credit-group { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.hero-num .hero-unit {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  margin-left: 4px;
+  letter-spacing: 0;
+}
 
-.credit-group-head {
+.hero-bars {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  min-width: 0;
+}
+
+.bar-name {
+  font-size: 11px;
+  color: var(--text-2);
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-name .sw { width: 7px; height: 7px; border-radius: 2.5px; flex: none; }
+.bar-name .sw.plan-c { background: var(--primary); }
+.bar-name .sw.bonus-c { background: var(--info); }
+.bar-name .sw.warn-c { background: var(--warn); }
+
+.bar-val {
+  font-family: var(--mono);
   font-size: 10.5px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
-.credit-group-label { color: var(--muted); }
-.credit-group-left { color: var(--text-2); }
+.bar-val b { color: var(--text-2); font-weight: 600; }
 
-.credit-group-sub {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 10.5px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.credit-track {
-  height: 4px;
-  border-radius: 100px;
-  background: var(--panel-3);
+/* 轨道用半透明白覆盖层；日间主题下白轨道在浅底上不可读，换成半透明黑 */
+.bar-track {
+  grid-column: 1 / -1;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .10);
   overflow: hidden;
 }
 
-.credit-track > i {
+html[data-theme="light"] .bar-track { background: rgba(15, 21, 25, .10); }
+
+.bar-fill {
   display: block;
   height: 100%;
-  border-radius: 100px;
-  background: var(--primary);
+  border-radius: 3px;
 }
 
+/* 渐变起点用 color-mix 从 token 现调（不硬编码颜色，日间主题自动跟随 token） */
+.bar-fill.plan-c { background: linear-gradient(90deg, color-mix(in srgb, var(--primary) 55%, transparent), var(--primary)); }
+.bar-fill.bonus-c { background: linear-gradient(90deg, color-mix(in srgb, var(--info) 55%, transparent), var(--info)); }
+.bar-fill.warn-c { background: linear-gradient(90deg, color-mix(in srgb, var(--warn) 55%, transparent), var(--warn)); }
+
+.bar-pct {
+  grid-column: 1 / -1;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: -3px;
+}
+
+.bar-row .credit-expiry { grid-column: 1 / -1; }
+
 .credit-expiry {
-  align-self: flex-start;
+  align-self: start;
+  justify-self: start;
   font-size: 9.5px;
   line-height: 15px;
   color: var(--warn);
@@ -1140,6 +1305,15 @@ select:disabled { opacity: .45; cursor: not-allowed; }
   border-radius: 3px;
   padding: 0 4px;
   font-weight: 600;
+}
+
+/* ---- 方案 A 响应式（账号页专属规则随本分区维护，不动分区 10） ---- */
+@media (max-width: 1100px) {
+  .detail-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .acc-meta { grid-template-columns: 1fr; }
 }
 
 /* ============ 7. 日志页 ============ */
@@ -1369,7 +1543,6 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 
   .acc-grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
   .settings { grid-template-columns: repeat(2, 1fr); }
-  .credit-total-value { font-size: 18px; }
 }
 
 /* ---- 900：侧栏横排到顶部，搜索框占整行 ---- */

@@ -193,6 +193,29 @@ function setButtonContent(button, iconName, label) {
 }
 
 /**
+ * 复制图标（精灵表里没有 copy 符号，这里内联一份 16x16 path，保持零依赖）。
+ * 描边 / 填充颜色由 CSS（.acc-line .copy svg）按 currentColor 控制。
+ * @returns {SVGElement}
+ */
+function copyIcon() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', '5.5');
+  rect.setAttribute('y', '5.5');
+  rect.setAttribute('width', '8');
+  rect.setAttribute('height', '8');
+  rect.setAttribute('rx', '1.5');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M10.5 5.5v-2a1 1 0 00-1-1h-6a1 1 0 00-1 1v6a1 1 0 001 1h2');
+  svg.appendChild(rect);
+  svg.appendChild(path);
+  return svg;
+}
+
+/**
  * 把时间戳格式化成 HH:MM（Asia/Shanghai）。
  * @param {number} ms
  * @returns {string}
@@ -329,6 +352,25 @@ function downloadJson(filename, data) {
 }
 
 /**
+ * 复制文本到剪贴板（navigator.clipboard；不可用时静默降级为提示 toast）。
+ * @param {string} text
+ * @param {string} label 复制对象的展示名（用于 toast 文案，如 'UID'）
+ */
+async function copyText(text, label) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      toast(`${label} 已复制到剪贴板`, 'ok');
+      return;
+    }
+    throw new Error('clipboard unavailable');
+  } catch {
+    // 剪贴板权限被拒 / 非 secure context：不打断用户，提示手动复制
+    toast('自动复制不可用，请手动复制', 'warn');
+  }
+}
+
+/**
  * 结果 -> 徽标。
  * @param {string|null} result
  * @returns {HTMLElement}
@@ -384,6 +426,18 @@ function tokenState(account) {
     if (tone !== 'bad') tone = 'warn';
   }
   return { text: parts.join(' · '), tone };
+}
+
+/**
+ * token 语气 -> meta 值配色类（对应 .acc-line .v 的 good / warn-t / bad）。
+ * @param {'ok'|'warn'|'bad'|'mute'} tone
+ * @returns {string}
+ */
+function tokenValueClass(tone) {
+  if (tone === 'bad') return 'bad';
+  if (tone === 'warn') return 'warn-t';
+  if (tone === 'ok') return 'good';
+  return '';
 }
 
 /**
@@ -1049,7 +1103,7 @@ function renderAccounts(force = false) {
 }
 
 /**
- * 账号卡片：基础信息 + 积分配额 + 操作。
+ * 账号卡片（方案 A · Dashboard Focus）：头部身份区 + 积分 Hero 面板 + meta 两列 + 操作区。
  *
  * ⚠ 不可改清单（test/frontend-filename.test.mjs 用正则从本函数抽取断言）：
  *   1. 必须存在 `el('div', 'acc-card-head')` 与 `el('div', 'acc-card-foot')`；
@@ -1110,19 +1164,39 @@ function accountCard(account) {
   head.appendChild(delBtn);
   card.appendChild(head);
 
-  // ---- 主体：UID / Token 生命周期 / 签到时间 / 积分配额 ----
+  // ---- 主体：积分 Hero 面板（视觉核心） + meta 两列（UID / Token / 签到时间 / 上次签到） ----
   const body = el('div', 'acc-card-b');
-  body.appendChild(cardLine('UID', account.uid || '—', 'mono'));
-  const token = tokenState(account);
-  body.appendChild(cardLine('Token', token.text, token.tone === 'bad' ? 'bad' : ''));
-  body.appendChild(cardLineControl('签到时间', checkinHourPicker(account)));
   body.appendChild(creditBlock(account, entry));
+
+  const meta = el('div', 'acc-meta');
+  const uidLine = cardLine('UID', account.uid || '—', 'mono');
+  if (account.uid) {
+    // UID 是高频粘贴项：hover / 键盘聚焦时浮出复制按钮，点击写入剪贴板
+    const copyBtn = el('button', 'copy');
+    copyBtn.type = 'button';
+    copyBtn.title = '复制 UID';
+    copyBtn.setAttribute('aria-label', `复制账号 ${account.name} 的 UID`);
+    copyBtn.appendChild(copyIcon());
+    copyBtn.addEventListener('click', () => {
+      void copyText(account.uid, 'UID');
+    });
+    uidLine.appendChild(copyBtn);
+  }
+  meta.appendChild(uidLine);
+
+  const token = tokenState(account);
+  meta.appendChild(cardLine('Token', token.text, tokenValueClass(token.tone)));
+  meta.appendChild(cardLineControl('签到时间', checkinHourPicker(account)));
+
+  const latest = latestRunFor(account.id);
+  meta.appendChild(cardLine('上次签到', latest && latest.startedAt ? fmtDayTime(latest.startedAt) : '—'));
+  body.appendChild(meta);
   card.appendChild(body);
 
-  // ---- 底部操作区：测试签到 / 刷新额度 / 导出（编辑与删除在头部图标位） ----
+  // ---- 底部操作区：测试签到（primary 主按钮）/ 刷新额度 / 导出（编辑与删除在头部图标位） ----
   const foot = el('div', 'acc-card-foot');
   // busy 态：文案不变 + 按钮内 spinner + disabled（不做绝对定位浮层，不替换文案）
-  const testBtn = el('button', `btn btn-ghost btn-sm${testing ? ' is-busy' : ''}`, '测试签到');
+  const testBtn = el('button', `btn btn-primary btn-sm${testing ? ' is-busy' : ''}`, '测试签到');
   testBtn.type = 'button';
   testBtn.disabled = testing || state.busy.run;
   testBtn.setAttribute('aria-busy', testing ? 'true' : 'false');
@@ -1254,6 +1328,8 @@ function accountRow(account) {
 
 /**
  * 列表视图的展开明细（行的兄弟节点，紧跟其后）。
+ * 方案 A：左右两栏 —— 左侧积分 Hero 面板（与卡片视图共用 creditBlock），
+ * 右侧 UID / Token / 上次签到 + 三个操作按钮。展开行本身（.t-row 六列）结构与交互不动。
  * @param {object} account
  * @returns {HTMLElement}
  */
@@ -1264,20 +1340,33 @@ function accountDetail(account) {
   wrap.hidden = !open;
 
   const entry = state.credits[account.id];
-  wrap.appendChild(creditBlock(account, entry));
+  const grid = el('div', 'detail-grid');
 
-  const foot = el('div', 'detail-foot');
-  // switchAt（积分切换时间）属于 cockpit tools 的字段，签到面板不展示
+  // 左：积分 Hero 面板（含加载 / 错误 / 空态，与卡片视图完全同源）
+  grid.appendChild(creditBlock(account, entry));
+
+  // 右：账号信息 + 操作
+  const side = el('div', 'detail-side');
+  side.appendChild(cardLine('UID', account.uid || '—', 'mono'));
+
   const token = tokenState(account);
-  foot.appendChild(el('span', null, `Token ${token.text}`));
+  // title 保留旧口径完整句子「Token 有效至 … · 可自动续期」，值本身不再重复前缀
+  const tokenText = `Token ${token.text}`;
+  const tokenLine = cardLine('Token', token.text, tokenValueClass(token.tone));
+  tokenLine.title = tokenText;
+  side.appendChild(tokenLine);
 
-  const grow = el('div', 'grow');
-  grow.appendChild(detailAction('刷新额度', () => loadCredits(account.id)));
-  grow.appendChild(detailAction('测试签到', () => testCheckin(account)));
-  grow.appendChild(detailAction('导出', () => askExportAccount(account)));
-  foot.appendChild(grow);
+  const latest = latestRunFor(account.id);
+  side.appendChild(cardLine('上次签到', latest && latest.startedAt ? fmtDayTime(latest.startedAt) : '—'));
 
-  wrap.appendChild(foot);
+  const actions = el('div', 'detail-actions');
+  actions.appendChild(detailAction('测试签到', () => testCheckin(account), 'btn-primary'));
+  actions.appendChild(detailAction('刷新额度', () => loadCredits(account.id)));
+  actions.appendChild(detailAction('导出', () => askExportAccount(account)));
+  side.appendChild(actions);
+
+  grid.appendChild(side);
+  wrap.appendChild(grid);
   return wrap;
 }
 
@@ -1285,10 +1374,11 @@ function accountDetail(account) {
  * 明细面板里的小按钮。
  * @param {string} label
  * @param {Function} onClick
+ * @param {string} [extraClass] 追加类（如 btn-primary 把「测试签到」升为主按钮）
  * @returns {HTMLElement}
  */
-function detailAction(label, onClick) {
-  const btn = el('button', 'btn btn-ghost btn-sm', label);
+function detailAction(label, onClick, extraClass) {
+  const btn = el('button', `btn btn-ghost btn-sm${extraClass ? ` ${extraClass}` : ''}`, label);
   btn.type = 'button';
   btn.addEventListener('click', onClick);
   return btn;
@@ -1340,39 +1430,47 @@ function creditBlock(account, entry) {
     return wrap;
   }
 
-  const usage = el('div', 'usage-line');
-  usage.appendChild(el('span', 'usage-label', '用量状态'));
-  usage.appendChild(el('span', `usage-value ${data.status === 'normal' ? 'is-ok' : 'is-warn'}`,
-    data.status === 'normal' ? '正常' : '异常'));
-  wrap.appendChild(usage);
+  // ---- Hero 头部：总剩余积分（大号等宽数字，卡片的核心视觉） ----
+  const top = el('div', 'hero-top');
+  const label = el('span', 'hero-label');
+  label.appendChild(el('span', 'hero-live'));
+  label.appendChild(document.createTextNode('总剩余积分'));
+  top.appendChild(label);
 
-  const total = el('div', 'credit-total');
-  total.appendChild(el('span', 'credit-total-label', '总剩余积分'));
-  total.appendChild(el('strong', 'credit-total-value', fmtCredits(data.totalLeft)));
-  wrap.appendChild(total);
+  const num = el('span', 'hero-num', fmtCredits(data.totalLeft));
+  // 只有确实是数字时才带「分」后缀；缺失态显示「—」时不带单位
+  if (data.totalLeft !== null && data.totalLeft !== undefined && Number.isFinite(Number(data.totalLeft))) {
+    num.appendChild(el('span', 'hero-unit', '分'));
+  }
+  top.appendChild(num);
+  wrap.appendChild(top);
 
+  // ---- 双色进度行：套餐基础 = primary 绿，平台奖励 = info 蓝（按展示顺序取色） ----
   const groups = Array.isArray(data.groups) ? data.groups : [];
   if (groups.length === 0) {
     wrap.appendChild(el('p', 'credit-loading', '暂无有效积分包'));
-  } else {
-    for (const group of groups) wrap.appendChild(creditGroupRow(group));
+    return wrap;
   }
+  const bars = el('div', 'hero-bars');
+  for (const group of groups) bars.appendChild(creditBarRow(group, bars.childElementCount));
+  wrap.appendChild(bars);
 
   // data.switchAt（积分切换时间）只有 cockpit tools 用，签到面板不展示
   return wrap;
 }
 
 /**
- * 单类积分：名称 + 剩余 + 已使用/总量 + 剩余百分比 + 进度条。
+ * Hero 面板里的单条进度行（色点 + 名称 + 已使用/总量 + 进度条 + 剩余百分比）。
  *
- * 条长表示**剩余额度**（越长越充足），与右侧「剩余 X%」同源。
- * ⚠ 不要改回 `used / total`：填充色是 --primary（青绿），用青绿表示「已用」会出现
- * 「绿条满格 = 额度用光」的反直觉表达。旁边「已使用 1,580 / 5,000」只是数字说明，不冲突。
+ * 条长表示**剩余额度**（越长越充足），与右侧「剩余 X%」同源 —— 与旧 credit-group 完全同一口径。
+ * ⚠ 不要改回 `used / total`：填充色是主题色，用主题色表示「已用」会出现
+ * 「满格 = 额度用光」的反直觉表达。旁边「已使用 x/y」只是数字说明，不冲突。
  * @param {object} group
+ * @param {number} index 展示顺序（决定配色档位）
  * @returns {HTMLElement}
  */
-function creditGroupRow(group) {
-  const row = el('div', 'credit-group');
+function creditBarRow(group, index) {
+  const row = el('div', 'bar-row');
 
   const total = Number(group.total);
   const used = Number(group.used);
@@ -1385,24 +1483,44 @@ function creditGroupRow(group) {
       ? Math.max(0, Math.min(100, Math.round(((total - used) / total) * 100)))
       : 0);
 
-  const head = el('div', 'credit-group-head');
-  head.appendChild(el('span', 'credit-group-label', group.label || '积分'));
-  head.appendChild(el('span', 'credit-group-left', fmtCredits(group.left)));
-  row.appendChild(head);
+  const name = el('span', 'bar-name');
+  name.appendChild(el('span', `sw ${barToneClass(index)}`));
+  name.appendChild(el('span', null, group.label || '积分'));
+  row.appendChild(name);
 
-  const sub = el('div', 'credit-group-sub');
-  sub.appendChild(el('span', null, `已使用 ${fmtCredits(group.used)}/${fmtCredits(group.total)}`));
-  sub.appendChild(el('span', null, `剩余${percent}%`));
-  row.appendChild(sub);
+  const val = el('span', 'bar-val');
+  val.appendChild(document.createTextNode('已使用 '));
+  val.appendChild(el('b', null, fmtCredits(group.used)));
+  val.appendChild(document.createTextNode(`/${fmtCredits(group.total)}`));
+  row.appendChild(val);
 
-  const track = el('div', 'credit-track');
-  const bar = el('i');
-  bar.style.width = `${percent}%`;
-  track.appendChild(bar);
+  const track = el('div', 'bar-track');
+  track.setAttribute('role', 'progressbar');
+  track.setAttribute('aria-label', `${group.label || '积分'}剩余额度`);
+  track.setAttribute('aria-valuemin', '0');
+  track.setAttribute('aria-valuemax', '100');
+  track.setAttribute('aria-valuenow', String(percent));
+  const fill = el('span', `bar-fill ${barToneClass(index)}`);
+  fill.style.width = `${percent}%`;
+  track.appendChild(fill);
   row.appendChild(track);
+
+  row.appendChild(el('span', 'bar-pct', `剩余 ${percent}%`));
 
   if (group.expiring) row.appendChild(el('span', 'credit-expiry', '即将过期'));
   return row;
+}
+
+/**
+ * 进度条配色档位：第 1 条 = 套餐基础（primary 绿），第 2 条 = 平台奖励（info 蓝），
+ * 更多档位（套餐赠送 / 购买积分）用 warn 琥珀区分，避免再引入新色彩 token。
+ * @param {number} index
+ * @returns {string}
+ */
+function barToneClass(index) {
+  if (index === 0) return 'plan-c';
+  if (index === 1) return 'bonus-c';
+  return 'warn-c';
 }
 
 /**
