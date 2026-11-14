@@ -722,18 +722,6 @@ function latestRunTodayFor(accountId) {
 }
 
 /**
- * 启用账号里最早的签到小时（用于「下次自动签到」）。
- * @returns {number|null}
- */
-function nextCheckinHour() {
-  const hours = state.accounts
-    .filter((account) => account && account.enabled === true)
-    .map((account) => (Number.isInteger(account.checkinHour) ? account.checkinHour : 8));
-  if (hours.length === 0) return null;
-  return Math.min(...hours);
-}
-
-/**
  * 当前北京时间的「当天第几分钟」（0~1439）。
  * 复用 CLOCK_FMT（Asia/Shanghai）避免新引入时区字符串；取模 24 兜住 ICU 的 24:00 写法。
  * @param {Date} [date]
@@ -748,16 +736,55 @@ function beijingMinuteOfDay(date = new Date()) {
 }
 
 /**
- * 「下次自动签到」：启用账号里最早的签到小时，外加「今天还是明天」。
- * 只有该时刻**严格晚于**当前北京分钟数才算今天（08:00 时 08:00 这轮已经在跑），
- * 否则顺延到明天——凌晨 02:00 时显示「08:00（今天）」而不是「08:00 明天」。
- * @returns {{hour:number, isTomorrow:boolean}|null}
+ * 「下次自动签到」：启用账号里**真正下一次**会触发的签到小时，外加「今天还是明天」。
+ *
+ * ⚠ 是「下一次」，不是「最小的小时」。账号小时是 [2, 9]、当前 03:00 时，最小的小时是 2，
+ * 但 2 点的窗口今天已经关了，今天还有动作的是 09:00 那个账号——所以要挑
+ * 「不早于当前小时的最小候选」，只有当前小时之后一个候选都没有时，才回到全局最小值并标明天。
+ * （例：[2, 9] @03:00 -> 09:00 今天；[2, 9] @10:00 -> 02:00 明天；[2, 9] @02:41 -> 02:00 今天。）
+ *
+ * 比较口径是**小时**，不是分钟——这是刻意对齐调度器语义的结果：
+ *   - wrangler.toml 的 cron 是 `0,15,30,45 * * * *`（每 15 分钟一轮），即每小时触发 4 次，
+ *     目标小时内的 :00 / :15 / :30 / :45 四轮都属于同一个签到窗口；
+ *   - src/schedule.js 的 accountsDueAt() 也只比对「北京小时相等」，
+ *     窗口内失败还会由后几轮自动重试。
+ * 所以此刻 02:41、目标小时 2 时，下一次动作就是**今天 02:45 那轮**，不该标「明天」；
+ * 反过来写成「目标分钟数 <= 当前分钟数 -> 明天」会在窗口中途提前跳到明天，
+ * 写成无条件加「明天」则凌晨会显示错。判据只能是「目标小时 < 当前北京小时」。
+ *
+ * 依赖只允许是 `state` 与 `beijingMinuteOfDay`（测试会把两者注入沙箱求值），
+ * 因此这里不引用任何模块级常量：默认小时 8 与 src/schedule.js 的 DEFAULT_CHECKIN_HOUR 对齐，
+ * 就地写成字面量；越界/非法小时也按同一口径回落 8 点，不取模兜底。
+ * @returns {{hour:number, isTomorrow:boolean}|null} 无启用账号时返回 null
  */
 function nextCheckinInfo() {
-  const hour = nextCheckinHour();
-  if (hour === null) return null;
-  const normalized = ((Number(hour) % 24) + 24) % 24;
-  return { hour, isTomorrow: normalized * 60 <= beijingMinuteOfDay() };
+  const hours = [];
+  for (const account of state.accounts) {
+    if (!account || account.enabled !== true) continue;
+    // 与 src/schedule.js 的 normalizeCheckinHour 同口径：只认 0~23 的整数（纯数字字符串也接受），
+    // 越界 / 小数 / 空值一律回落 8 点（= DEFAULT_CHECKIN_HOUR）。
+    // 越界值不能取模兜底，否则手改 KV 写成 25 会算成 1 点，与后端「25 -> 8 点」分叉。
+    let value = account.checkinHour;
+    if (typeof value === 'string') value = value.trim() === '' ? NaN : Number(value);
+    const valid = Number.isInteger(value) && value >= 0 && value <= 23;
+    const hour = valid ? value : 8;
+    if (!hours.includes(hour)) hours.push(hour);
+  }
+  if (hours.length === 0) return null;
+  // 当前北京小时（0~23）；beijingMinuteOfDay() 保持无参调用，便于测试注入。
+  const currentHour = Math.floor(beijingMinuteOfDay() / 60);
+  let next = null;
+  for (const candidate of hours) {
+    if (candidate >= currentHour && (next === null || candidate < next)) next = candidate;
+  }
+  // 今天还有窗口没关：最近的那个候选就是「今天」的下一次
+  if (next !== null) return { hour: next, isTomorrow: false };
+  // 今天的窗口全关了：回到全局最小值，落在明天
+  let earliest = hours[0];
+  for (const candidate of hours) {
+    if (candidate < earliest) earliest = candidate;
+  }
+  return { hour: earliest, isTomorrow: true };
 }
 
 /**
@@ -847,7 +874,7 @@ function renderKpis() {
       : (creditReady === 0 ? '尚未查询额度' : `${creditReady} / ${accounts.length} 个已查询`);
   }
 
-  // 4. 下次自动签到（启用账号里最早的 checkinHour；已过点则顺延到明天）
+  // 4. 下次自动签到（启用账号里「不早于当前小时」的最小整点；今天的窗口全关才顺延到明天）
   const nextInfo = nextCheckinInfo();
   const hour = nextInfo ? nextInfo.hour : null;
   const nextNode = $('#kpi-next');
@@ -864,7 +891,12 @@ function renderKpis() {
     const parts = [`${accounts.length} 个账号`];
     if (todayRun) parts.push(`今日 ${Number(todayRun.success) || 0} / ${Number(todayRun.total) || 0} 已签到`);
     if (creditReady > 0) parts.push(`共 ${fmtCredits(creditSum)} 积分`);
-    if (hour !== null) parts.push(`下次自动 ${fmtHour(hour)}`);
+    // 与 KPI 卡片共用同一份 nextCheckinInfo()，避免同屏两处对「今天/明天」各说各话
+    if (nextInfo) {
+      parts.push(nextInfo.isTomorrow
+        ? `下次自动 明天 ${fmtHour(nextInfo.hour)}`
+        : `下次自动 ${fmtHour(nextInfo.hour)}`);
+    }
     sub.textContent = parts.join(' · ');
   }
 }
@@ -878,8 +910,9 @@ function renderNav() {
 
   const next = $('#side-next');
   if (next) {
-    const hour = nextCheckinHour();
-    next.textContent = hour === null ? '—' : fmtHour(hour);
+    // 同一份 nextCheckinInfo()；侧栏空间小，只给钟点，不追「明天」
+    const info = nextCheckinInfo();
+    next.textContent = info === null ? '—' : fmtHour(info.hour);
   }
 
   const version = $('#side-version');

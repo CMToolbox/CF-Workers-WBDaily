@@ -5,12 +5,17 @@
 //
 // 覆盖两处日期语义修复：
 //   B2 状态徽标必须按「北京日期」过滤 run（昨天 20:37 的 already_checked_in 不得显示成「今日已签」）
-//   B5 KPI「下次自动签到」不无条件追加「明天」（只有该小时已过才顺延）
+//   B5 KPI「下次自动签到」= 启用账号里**真正下一次**的整点，只有「候选小时 < 当前北京小时」才顺延明天
+//      （口径是**小时**而非分钟：cron 是 */15，目标小时内 :00/:15/:30/:45 同属一个窗口，
+//        与 src/schedule.js 的 accountsDueAt() 一致；所以 02:41 时 2 点窗口还开着，不是明天）
 // 外加 B1 / B3 的静态守卫断言。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+// 生产调度器：用来做「前端 KPI 口径 == 后端真正会调度的整点」的交叉校验，
+// 而不是在测试里再写一份「什么算下一次」的复刻逻辑（复刻一旦和实现同错就永远测不出来）。
+import { accountsDueAt, normalizeCheckinHour } from '../src/schedule.js';
 
 const APP_PATH = new URL('../public/app.js', import.meta.url);
 const CSS_PATH = new URL('../public/styles.css', import.meta.url);
@@ -87,6 +92,64 @@ function extractClockFmt() {
   return new Function(`${matched[0]}\nreturn CLOCK_FMT;`)();
 }
 
+/**
+ * 找出「块注释正文里混进注释终止符（星号紧跟斜杠）」的行。
+ * 这不是洁癖：块注释的终止符（星号紧跟斜杠）会**提前闭合注释**，剩下半句被当成代码解析，
+ * 浏览器给出的就是整包 SyntaxError —— 整个面板一行 JS 都不执行（白屏）。
+ * 踩过的现场：在 JSDoc 里直接写 cron 表达式（`星号 + 斜杠 + 15` 那种写法），
+ * 于是注释在那一行就被提前闭合了。
+ * @param {string} src
+ * @returns {string[]} 形如 `747: *   - wrangler.toml 的 cron 是 ...`
+ */
+function findCommentTerminatorTraps(src) {
+  const traps = [];
+  let inBlock = false;
+  src.split('\n').forEach((text, index) => {
+    const trimmed = text.trim();
+    if (!inBlock) {
+      if (!trimmed.startsWith('/*')) return;
+      inBlock = true;
+      // 单行块注释 `/* ... */` 自己就闭合了
+      if (trimmed.slice(2).includes('*/')) inBlock = false;
+      return;
+    }
+    // 去掉行首的 `*` 装饰后再找 `*/`；闭合行 ` */` 去掉星号只剩 `/`，不会误报
+    const body = trimmed.replace(/^\*+/, '');
+    if (body.includes('*/')) traps.push(`${index + 1}: ${trimmed}`);
+    if (trimmed.endsWith('*/')) inBlock = false;
+  });
+  return traps;
+}
+
+test('静态守卫：public/app.js 必须能通过语法解析（注释里混入 */ 会让整页 JS 不执行）', () => {
+  const src = readText(APP_PATH);
+
+  // 1) 先抓「块注释里写了 */」这个具体陷阱，失败信息直接给行号，比 SyntaxError 好定位
+  const traps = findCommentTerminatorTraps(src);
+  assert.deepEqual(
+    traps,
+    [],
+    `块注释正文里混入 */ 会提前闭合注释，后续半句被当成代码：\n${traps.join('\n')}`,
+  );
+
+  // 2) 再做整体语法检查。只编译不执行，不需要新依赖，也不需要 node --check 子进程。
+  //    app.js 里没有 import/export 声明、也没有顶层 await，所以 Function 构造器够用。
+  let parseError = null;
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function(src);
+  } catch (err) {
+    parseError = err;
+  }
+  assert.equal(
+    parseError,
+    null,
+    parseError
+      ? `public/app.js 无法解析，浏览器会整包拒绝执行（面板白屏）：${parseError.message}`
+      : 'public/app.js 可以正常解析',
+  );
+});
+
 // ============ 时间锚点（全部写成带 +08:00 的绝对时刻，与机器时区无关） ============
 
 /** 「现在」= 北京 2026-11-15 02:00（真机 bug 场景的同一时刻）。 */
@@ -141,14 +204,20 @@ function makeStatusBadge({ logs, accounts, credits = {}, now = NOW_BJ_1115_0200 
  * nextCheckinInfo 内部是**无参**调用 beijingMinuteOfDay()，而后者默认 new Date()。
  * 为了不依赖真机时钟，这里注入一个「带固定分钟数」的替代实现：
  * 无参调用返回注入值，带参调用仍走生产实现（保证两种调用口径都被覆盖）。
- * @param {{accounts:object[], minuteOfDay:number}} params
+ *
+ * 自由变量只有 state 与 beijingMinuteOfDay —— `nextCheckinHour()` 已被删除，
+ * 若这里再注入它，functionSource() 会因源码里找不到该函数而直接断言失败
+ * （这正是上一轮 5 条用例集体报错的原因）。
+ *
+ * @param {{accounts:object[], minuteOfDay:number|Function}} params
+ *   minuteOfDay 传函数时每次调用重新求值，便于在一个沙箱里遍历多个时刻（避免反复重编译）。
  * @returns {Function} nextCheckinInfo
  */
 function makeNextCheckinInfo({ accounts, minuteOfDay }) {
   const realMinuteOfDay = evalWith({ CLOCK_FMT: extractClockFmt() }, 'beijingMinuteOfDay');
-  const beijingMinuteOfDay = (date) => (date === undefined ? minuteOfDay : realMinuteOfDay(date));
-  const nextCheckinHour = evalWith({ state: { accounts } }, 'nextCheckinHour');
-  return evalWith({ nextCheckinHour, beijingMinuteOfDay }, 'nextCheckinInfo');
+  const clock = typeof minuteOfDay === 'function' ? minuteOfDay : () => minuteOfDay;
+  const beijingMinuteOfDay = (date) => (date === undefined ? clock() : realMinuteOfDay(date));
+  return evalWith({ state: { accounts }, beijingMinuteOfDay }, 'nextCheckinInfo');
 }
 
 // ============ 时间锚点自检：先证明锚点算出来的北京日期符合预期 ============
@@ -339,14 +408,15 @@ test('nextCheckinInfo：北京 09:30 + hour 8 -> 明天', () => {
   assert.deepEqual(nextCheckinInfo(), { hour: 8, isTomorrow: true });
 });
 
-test('nextCheckinInfo：北京 08:00 整 + hour 8 -> 明天（口径是「严格大于」，08:00 这轮已在跑）', () => {
-  // 已文档化口径：isTomorrow = hour*60 <= 当前分钟数。
-  // 恰好等于 480 时判为「明天」，避免 08:00 时提示「今天 08:00」这种已经发生过的自我指涉。
+test('nextCheckinInfo：北京 08:00 整 + hour 8 -> 今天（08:00 属同一小时窗口，仍算今天）', () => {
+  // 口径是**小时**：08:00-08:59 整段窗口都在跑（cron */15 在 :00/:15/:30/:45 各触发一轮，
+  // src/schedule.js 的 accountsDueAt() 只比对北京小时相等）。所以 08:00 时下一次动作
+  // 还在今天，不能标「明天」——上一轮写成 hour*60 <= now 的「严格大于」是错的。
   const nextCheckinInfo = makeNextCheckinInfo({
     accounts: [{ id: 'acc_1', enabled: true, checkinHour: 8 }],
     minuteOfDay: 8 * 60,
   });
-  assert.deepEqual(nextCheckinInfo(), { hour: 8, isTomorrow: true });
+  assert.deepEqual(nextCheckinInfo(), { hour: 8, isTomorrow: false });
 });
 
 test('nextCheckinInfo：北京 07:59 + hour 8 -> 今天（差一分钟仍属今天）', () => {
@@ -357,17 +427,50 @@ test('nextCheckinInfo：北京 07:59 + hour 8 -> 今天（差一分钟仍属今�
   assert.deepEqual(nextCheckinInfo(), { hour: 8, isTomorrow: false });
 });
 
-test('nextCheckinInfo：取启用账号里最早的小时；无启用账号 -> null', () => {
-  const nextCheckinInfo = makeNextCheckinInfo({
-    accounts: [
-      { id: 'acc_1', enabled: true, checkinHour: 9 },
-      { id: 'acc_2', enabled: true, checkinHour: 8 },
-      { id: 'acc_3', enabled: false, checkinHour: 6 },
-    ],
-    minuteOfDay: 2 * 60,
-  });
-  assert.deepEqual(nextCheckinInfo(), { hour: 8, isTomorrow: false });
+test('nextCheckinInfo：返回「真正下一次」而不是「最小的小时」（用户实测 02:41 场景）', () => {
+  /** @type {object[]} 2 点那个账号 */
+  const HOUR_2 = [{ id: 'acc_2', enabled: true, checkinHour: 2 }];
+  /** @type {object[]} 8 点那个账号 */
+  const HOUR_8 = [{ id: 'acc_8', enabled: true, checkinHour: 8 }];
+  /** @type {object[]} 9 点那个账号 */
+  const HOUR_9 = [{ id: 'acc_9', enabled: true, checkinHour: 9 }];
+  const TWO_AND_NINE = [...HOUR_2, ...HOUR_9];
+  const EIGHT_AND_NINE = [...HOUR_8, ...HOUR_9];
 
+  // [2,9] @02:41（用户截图原场景）：2 点窗口还开着，02:45 那轮会跑 -> 今天，不是明天
+  assert.deepEqual(
+    makeNextCheckinInfo({ accounts: TWO_AND_NINE, minuteOfDay: 2 * 60 + 41 })(),
+    { hour: 2, isTomorrow: false },
+    '02:41 时 2 点窗口未关，下一次动作是今天 02:45',
+  );
+
+  // [2,9] @03:00：最小的小时是 2，但 2 点窗口今天已关；今天还有动作的是 09:00 那个账号
+  assert.deepEqual(
+    makeNextCheckinInfo({ accounts: TWO_AND_NINE, minuteOfDay: 3 * 60 })(),
+    { hour: 9, isTomorrow: false },
+    '最小的小时（2）不是下一次，旧实现会在这里错报「02:00 明天」',
+  );
+
+  // [2,9] @10:00：两个窗口今天都关了，才回到全局最小值 2 点并标明天
+  assert.deepEqual(
+    makeNextCheckinInfo({ accounts: TWO_AND_NINE, minuteOfDay: 10 * 60 })(),
+    { hour: 2, isTomorrow: true },
+  );
+
+  // [8,9] @09:30：9 点窗口内 09:45 还会跑
+  assert.deepEqual(
+    makeNextCheckinInfo({ accounts: EIGHT_AND_NINE, minuteOfDay: 9 * 60 + 30 })(),
+    { hour: 9, isTomorrow: false },
+  );
+
+  // [8,9] @08:30：8 点窗口内 08:45 还会跑（8 比 9 早，取更近的那个）
+  assert.deepEqual(
+    makeNextCheckinInfo({ accounts: EIGHT_AND_NINE, minuteOfDay: 8 * 60 + 30 })(),
+    { hour: 8, isTomorrow: false },
+  );
+});
+
+test('nextCheckinInfo：无启用账号 / 空数组 -> null（KPI 显示 —）', () => {
   const noneEnabled = makeNextCheckinInfo({
     accounts: [{ id: 'acc_1', enabled: false, checkinHour: 8 }],
     minuteOfDay: 2 * 60,
@@ -376,6 +479,194 @@ test('nextCheckinInfo：取启用账号里最早的小时；无启用账号 -> n
 
   const empty = makeNextCheckinInfo({ accounts: [], minuteOfDay: 2 * 60 });
   assert.equal(empty(), null);
+});
+
+test('nextCheckinInfo：禁用账号不参与选取，0 点（falsy 整数）不得被当成「未设置」', () => {
+  // 禁用账号的 6 点不许抢走「下一次」
+  const withDisabled = makeNextCheckinInfo({
+    accounts: [
+      { id: 'acc_1', enabled: true, checkinHour: 9 },
+      { id: 'acc_2', enabled: true, checkinHour: 8 },
+      { id: 'acc_3', enabled: false, checkinHour: 6 },
+    ],
+    minuteOfDay: 2 * 60,
+  });
+  assert.deepEqual(withDisabled(), { hour: 8, isTomorrow: false });
+
+  // 0 点是 falsy：写成 `account.checkinHour || 8` 会把它错当默认值 8
+  const midnight = makeNextCheckinInfo({
+    accounts: [{ id: 'acc_0', enabled: true, checkinHour: 0 }, { id: 'acc_8', enabled: true, checkinHour: 8 }],
+    minuteOfDay: 30,
+  });
+  assert.deepEqual(midnight(), { hour: 0, isTomorrow: false }, '00:30 时 0 点窗口仍开着');
+
+  const midnightPassed = makeNextCheckinInfo({
+    accounts: [{ id: 'acc_0', enabled: true, checkinHour: 0 }, { id: 'acc_8', enabled: true, checkinHour: 8 }],
+    minuteOfDay: 60,
+  });
+  assert.deepEqual(midnightPassed(), { hour: 8, isTomorrow: false });
+});
+
+test('nextCheckinInfo：重复小时去重；非法/缺失小时回落到 8 点（与 normalizeCheckinHour 一致）', () => {
+  const duplicated = makeNextCheckinInfo({
+    accounts: [
+      { id: 'acc_1', enabled: true, checkinHour: 9 },
+      { id: 'acc_2', enabled: true, checkinHour: 9 },
+    ],
+    minuteOfDay: 10 * 60,
+  });
+  assert.deepEqual(duplicated(), { hour: 9, isTomorrow: true });
+
+  // 缺失 / null / 非整数 -> 全部按 8 点算（= src/schedule.js 的 DEFAULT_CHECKIN_HOUR）
+  const fallback = makeNextCheckinInfo({
+    accounts: [
+      { id: 'acc_1', enabled: true },
+      { id: 'acc_2', enabled: true, checkinHour: null },
+      { id: 'acc_3', enabled: true, checkinHour: 8.5 },
+    ],
+    minuteOfDay: 2 * 60,
+  });
+  assert.deepEqual(fallback(), { hour: 8, isTomorrow: false });
+});
+
+test('nextCheckinInfo：非法 / 越界 / 字符串小时与后端 normalizeCheckinHour 完全同口径', () => {
+  // 前端不能自己发明一套「怎么算合法的 0~23 整点」。这里直接拿后端那两个函数当预言机：
+  // 越界值退回「取模兜底」（25 -> 1 点）就会和调度器的「25 -> 8 点」分叉，
+  // 面板会承诺一个永远不会发生的签到时间。
+  const raws = [
+    undefined, null, '', '   ', 0, 8, 23, '9', ' 10 ', 24, 25, -1, 8.5, 'abc', true, '0x10',
+  ];
+  for (const raw of raws) {
+    const expected = normalizeCheckinHour(raw);
+    // 把「当前小时」设成该账号折成的小时：这一次一定是今天的这一档
+    const got = makeNextCheckinInfo({
+      accounts: [{ id: 'acc_x', enabled: true, checkinHour: raw }],
+      minuteOfDay: expected * 60,
+    })();
+    assert.deepEqual(
+      got,
+      { hour: expected, isTomorrow: false },
+      `checkinHour=${JSON.stringify(raw)} 应折成后端认可的 ${expected} 点`,
+    );
+  }
+});
+
+test('nextCheckinInfo 与生产调度器 accountsDueAt 逐小时交叉校验（口径不许漂移）', () => {
+  /**
+   * 北京 2026-11-15 的 hour 点整对应的毫秒。
+   * 北京 = UTC+8，所以北京 h 点 = UTC (h-8) 点；Date.UTC 会自动把负数/超过 23 归一成跨日。
+   * @param {number} hour
+   * @returns {number}
+   */
+  const beijingMs = (hour) => Date.UTC(2026, 10, 15, hour - 8);
+
+  const configs = [
+    [{ id: 'a', enabled: true, checkinHour: 8 }],
+    [{ id: 'a', enabled: true, checkinHour: 2 }, { id: 'b', enabled: true, checkinHour: 9 }],
+    [{ id: 'a', enabled: true, checkinHour: 0 }, { id: 'b', enabled: true, checkinHour: 23 }],
+    [{ id: 'a', enabled: true, checkinHour: 8 }, { id: 'b', enabled: false, checkinHour: 5 }],
+    [{ id: 'a', enabled: true, checkinHour: 9 }, { id: 'b', enabled: true, checkinHour: 9 }],
+    [{ id: 'a', enabled: true, checkinHour: 23 }],
+  ];
+
+  for (const accounts of configs) {
+    // 调度器视角：哪几个整点这组账号真的会被调度（用的是生产代码，不是复刻逻辑）
+    const dueHours = [];
+    for (let hour = 0; hour < 24; hour += 1) {
+      if (accountsDueAt(accounts, beijingMs(hour)).length > 0) dueHours.push(hour);
+    }
+    assert.ok(dueHours.length > 0, '这组账号至少有一个可调度整点');
+
+    // 窗口内的三个代表时刻：:00（刚进窗口）、:30（窗口中段）、:59（窗口最后一分钟）
+    for (const minuteOffset of [0, 30, 59]) {
+      let minuteOfDay = 0;
+      const nextCheckinInfo = makeNextCheckinInfo({ accounts, minuteOfDay: () => minuteOfDay });
+      for (let currentHour = 0; currentHour < 24; currentHour += 1) {
+        minuteOfDay = currentHour * 60 + minuteOffset;
+        const todayPending = dueHours.filter((hour) => hour >= currentHour);
+        const expectToday = todayPending.length > 0;
+        const label = `hours=[${accounts.map((a) => a.checkinHour).join(',')}] @${currentHour}:${String(minuteOffset).padStart(2, '0')}`;
+        assert.deepEqual(
+          nextCheckinInfo(),
+          { hour: expectToday ? todayPending[0] : dueHours[0], isTomorrow: !expectToday },
+          `${label} 的「下一次」与调度器口径不一致`,
+        );
+      }
+    }
+  }
+});
+
+// ============ B5 静态守卫：单一数据源 + 无参时钟签名 ============
+
+test('B5 静态守卫：public/app.js 里 nextCheckinHour 已彻底不存在（函数与调用点都已删除）', () => {
+  // 注：这里只对**代码**严格。若将来有人在注释里写「原 nextCheckinHour 已合并进
+  // nextCheckinInfo」这种迁移说明，不应该判失败（与上面 B3 的 switchAt 守卫同一口径）。
+  const code = codeOnly(readApp());
+  assert.equal(code.includes('nextCheckinHour'), false, '代码里不得再引用 nextCheckinHour');
+  // 但函数定义本身必须是真删了，不能只留个空壳或改名后仍导出旧语义
+  assert.equal(/function\s+nextCheckinHour\s*\(/.test(readApp()), false, 'nextCheckinHour 定义必须已删除');
+});
+
+test('B5 静态守卫：beijingMinuteOfDay 保持 `date = new Date()` 默认参数的无参调用签名', () => {
+  // 测试沙箱靠「无参调用走注入时钟」来固定时间，签名一改（比如改成必传参数或
+  // Date.now()）所有时间相关用例就会静默失真，必须锁住。
+  assert.match(
+    readApp(),
+    /function beijingMinuteOfDay\(date = new Date\(\)\)/,
+    'beijingMinuteOfDay 必须保留 date = new Date() 默认参数',
+  );
+  // nextCheckinInfo 内部必须真的无参调用它（而不是自己 new Date()）
+  assert.match(
+    functionSource('nextCheckinInfo'),
+    /beijingMinuteOfDay\(\)/,
+    'nextCheckinInfo 必须无参调用 beijingMinuteOfDay()，不得自行 new Date()',
+  );
+  assert.equal(
+    /new Date\(\)/.test(functionSource('nextCheckinInfo')),
+    false,
+    'nextCheckinInfo 不得直接 new Date()，否则时间无法注入',
+  );
+});
+
+test('B5 静态守卫：KPI / 页头副标题 / 侧栏三处共用同一份 nextCheckinInfo()', () => {
+  const code = codeOnly(readApp());
+  const definitions = (code.match(/function nextCheckinInfo\(\)/g) || []).length;
+  assert.equal(definitions, 1, 'nextCheckinInfo 只能有一份实现，否则同屏两处会对「今天/明天」各说各话');
+
+  // 调用点：renderKpis 一处（KPI 卡片与 #accounts-sub 共用同一份结果）+ renderNav 一处（#side-next）
+  const callSites = (code.match(/nextCheckinInfo\(\)/g) || []).length - definitions;
+  assert.ok(callSites >= 2, `nextCheckinInfo() 至少要有 2 个调用点（renderKpis / renderNav），实际 ${callSites} 处`);
+  const mentions = (code.match(/nextCheckinInfo/g) || []).length;
+  assert.ok(mentions >= 3, `app.js 里 nextCheckinInfo 引用计数（含定义）应 ≥ 3，实际 ${mentions}`);
+
+  const kpis = codeOnly(functionSource('renderKpis'));
+  // 只求值一次、两个展示位共用同一个 nextInfo —— 这才是「不会各说各话」的真正保证
+  assert.equal(
+    (kpis.match(/nextCheckinInfo\(\)/g) || []).length,
+    1,
+    'renderKpis 只应求值一次 nextCheckinInfo()，KPI 与 #accounts-sub 共用该结果',
+  );
+  assert.ok((kpis.match(/nextInfo/g) || []).length >= 4, 'KPI 卡片与 #accounts-sub 都必须读同一份 nextInfo');
+  const nav = codeOnly(functionSource('renderNav'));
+  assert.equal((nav.match(/nextCheckinInfo\(\)/g) || []).length, 1, 'renderNav 的 #side-next 必须复用同一份 nextCheckinInfo()');
+
+  // KPI：<small>明天</small> 只在 isTomorrow 时挂上去（今天时不得出现）
+  assert.match(
+    kpis,
+    /nextInfo\.isTomorrow\) nextNode\.appendChild\(el\('small', null, '明天'\)\)/,
+    '#kpi-next 的「明天」小字必须受 nextInfo.isTomorrow 控制',
+  );
+  // 页头副标题：明天时带「明天 」前缀，今天时不带
+  assert.match(
+    kpis,
+    /下次自动 明天 \$\{fmtHour\(nextInfo\.hour\)\}/,
+    '#accounts-sub 的明天分支必须带「下次自动 明天 」文案',
+  );
+  assert.match(
+    kpis,
+    /下次自动 \$\{fmtHour\(nextInfo\.hour\)\}/,
+    '#accounts-sub 的今天分支必须是「下次自动 HH:00」，不带「明天」',
+  );
 });
 
 // ============ B3：字段移除的静态守卫 ============
