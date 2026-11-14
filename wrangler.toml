@@ -2,6 +2,7 @@
 name = "cf-workers-wbdaily"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
+keep_vars = true
 
 # 静态前端（零构建）。not_found_handling 必须是 none：
 # 未命中文件时把请求交回 Worker，避免 POST /api/* 拿到 200 HTML。
@@ -13,7 +14,7 @@ not_found_handling = "none"
 # 唯一 KV binding。部署前把 id 换成 `wrangler kv namespace create WB_KV` 的输出。
 [[kv_namespaces]]
 binding = "WB_KV"
-id = "REPLACE_WITH_YOUR_KV_ID"
+id = "c2ae825de41b4d3a83d97f358a87d5fa" #改成你自己的KV数据库id
 
 # 每日 01:00 UTC（= 09:00 Asia/Shanghai）
 [triggers]
