@@ -104,6 +104,9 @@
             <button id="btn-export-accounts" class="btn btn-ghost" type="button" title="导出全部账号 JSON（含明文 token）；只导出单个账号请用账号卡片内的「导出」按钮">
               <span class="icon" data-icon="download" aria-hidden="true"></span>导出全部
             </button>
+            <button id="btn-spread-hours" class="btn btn-ghost" type="button" title="把启用账号的签到时间按顺序排成 08:00、09:00、10:00…，避免全部堆在同一小时">
+              <span class="icon" data-icon="clock" aria-hidden="true"></span>错开签到时间
+            </button>
             <button id="btn-add-account" class="btn btn-ghost" type="button">
               <span class="icon" data-icon="plus" aria-hidden="true"></span>新增账号
             </button>
@@ -184,19 +187,10 @@
           </div>
 
           <div class="setting">
-            <h3>签到时间（北京时间）</h3>
-            <p class="muted">每小时整点起算。Cron 每 15 分钟轮询一次，只有落在该小时的触发才真正签到，同一小时最多重试 4 轮。</p>
-            <div class="row-inline">
-              <select id="checkin-hour-select" class="input input-sm" aria-label="签到小时"></select>
-              <button id="btn-save-checkin-hour" class="btn btn-ghost" type="button">保存</button>
-            </div>
-            <p id="checkin-hour-hint" class="hint" hidden>已保存，下一次 Cron 触发即生效。</p>
-          </div>
-
-          <div class="setting">
-            <h3>Cron</h3>
-            <p class="muted">每天 <strong id="cron-local">08:00</strong>（Asia/Shanghai）执行；对应 UTC <strong id="cron-utc">00:00</strong>。</p>
-            <p class="muted">部署表达式固定为 <code>*/15 * * * *</code>（每 15 分钟轮询），签到小时由上面的设置决定，改时间不需要重新部署。</p>
+            <h3>Cron 调度</h3>
+            <p class="muted"><strong>签到时间是按账号单独设置的</strong>，在每张账号卡片上选自己的北京时间整点。不同账号请错开小时（如 08 / 09 / 10），避免同一分钟集中打上游。</p>
+            <p class="muted">部署表达式固定为 <code>*/15 * * * *</code>（每 15 分钟轮询，UTC）：目标小时内的 <code>:00</code> / <code>:15</code> / <code>:30</code> / <code>:45</code> 共 4 轮都算窗口，首轮成功后写进度、后 3 轮零请求短路，首轮失败则后 3 轮自动重试。</p>
+            <p class="muted">面板填的是北京时间（Asia/Shanghai），代码在判断时自行换算，不需要你算 UTC。</p>
             <p class="muted">版本 <span id="settings-version">-</span></p>
           </div>
         </div>

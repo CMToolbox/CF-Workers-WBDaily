@@ -538,11 +538,9 @@ test('PUT /api/settings：4 → 400、5 → 200、101 → 400', async () => {
   const ok5 = await dispatch(ctx, '/api/settings', { method: 'PUT', cookie, body: { retentionRuns: 5 } });
   assert.equal(ok5.status, 200);
   assert.equal(ok5.body.data.retentionRuns, 5);
-  // 默认签到小时是北京时间 08:00，对应 UTC 00:00；cronUtc/cronLocal 现在是「时刻」而非表达式
-  assert.equal(ok5.body.data.checkinHour, 8);
-  assert.equal(ok5.body.data.cronUtc, '00:00');
-  assert.equal(ok5.body.data.cronLocal, '08:00');
+  // 签到时间已改为每账号属性，settings 里只剩日志保留条数与固定的轮询间隔
   assert.equal(ok5.body.data.cronIntervalMinutes, 15);
+  assert.equal('checkinHour' in ok5.body.data, false, '全局签到时间必须已移除');
   assert.equal(typeof ok5.body.data.kvWritesToday, 'number');
 });
 
@@ -791,7 +789,7 @@ test('F3 补充：GET /api/settings 形状不变（不泄漏 PUT 独有的 evict
 
   const got = await dispatch(ctx, '/api/settings', { cookie });
   assert.deepEqual(Object.keys(got.body.data).sort(), [
-    'checkinHour', 'cronIntervalMinutes', 'cronLocal', 'cronUtc', 'kvWritesToday', 'retentionRuns',
+    'cronIntervalMinutes', 'kvWritesToday', 'retentionRuns',
   ]);
   assert.equal('evicted' in got.body.data, false);
   assert.equal('evictFailed' in got.body.data, false);

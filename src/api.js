@@ -31,7 +31,7 @@ import { svcAccountCredits } from './credits.js';
 import { buildCockpitExport, mergeImportedAccounts, normalizeImportPayload } from './account-io.js';
 import { withFreshToken, tokenExpiresAtMs } from './upstream-token.js';
 import { recordProgress } from './progress.js';
-import { CRON_INTERVAL_MINUTES, DEFAULT_CHECKIN_HOUR, deriveCronTexts } from './schedule.js';
+import { CRON_INTERVAL_MINUTES, normalizeCheckinHour, parseCheckinHour, pickNextCheckinHour } from './schedule.js';
 
 /** 服务版本号（bootstrap 与 MCP serverInfo 保持一致）。 */
 export const VERSION = '1.0.0';
@@ -174,6 +174,8 @@ function maskAccount(account) {
     updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
     tokenExpiresAt: expMs === null ? null : isoNow(expMs),
     hasRefreshToken: typeof src.refreshToken === 'string' && Boolean(src.refreshToken),
+    // 每账号独立的签到小时（北京时间 0~23），缺失时回落默认 8 点
+    checkinHour: normalizeCheckinHour(src.checkinHour),
   };
 }
 
@@ -233,6 +235,14 @@ export async function svcCreateAccount(ctx, input) {
   if (remark.length > REMARK_MAX_LENGTH) {
     throw new AppError('BAD_REQUEST', `备注不能超过 ${REMARK_MAX_LENGTH} 个字符`);
   }
+  // 签到小时：显式传了就必须合法；没传则自动挑一个没被占用的整点，避免新账号全部压在 8 点
+  let checkinHour = null;
+  if (src.checkinHour !== undefined && src.checkinHour !== null && src.checkinHour !== '') {
+    checkinHour = parseCheckinHour(src.checkinHour);
+    if (checkinHour === null) {
+      throw new AppError('BAD_REQUEST', 'checkinHour 必须是 0~23 的整数（北京时间整点）');
+    }
+  }
   const accounts = await ctx.kv.getAccounts();
   if (accounts.length >= MAX_ACCOUNTS) {
     throw new AppError('CONFLICT', `最多 ${MAX_ACCOUNTS} 个账号`);
@@ -245,6 +255,7 @@ export async function svcCreateAccount(ctx, input) {
     uid,
     enabled: src.enabled === undefined ? true : src.enabled === true,
     remark,
+    checkinHour: pickNextCheckinHour(accounts, checkinHour),
     createdAt: nowIso,
     updatedAt: nowIso,
   };
@@ -309,6 +320,14 @@ export async function svcUpdateAccount(ctx, id, input) {
   }
   if (src.enabled !== undefined) {
     next.enabled = src.enabled === true;
+  }
+  // 签到小时（北京时间整点）：传了才改，非法直接 400，避免静默回落造成"改了没生效"
+  if (src.checkinHour !== undefined && src.checkinHour !== null && src.checkinHour !== '') {
+    const hour = parseCheckinHour(src.checkinHour);
+    if (hour === null) {
+      throw new AppError('BAD_REQUEST', 'checkinHour 必须是 0~23 的整数（北京时间整点）');
+    }
+    next.checkinHour = hour;
   }
   next.updatedAt = isoNow(ctx.now());
 
@@ -388,9 +407,9 @@ export async function svcClearLogs(ctx) {
  * - ctx.writes()：本 isolate 累计写次数（覆盖 setup / 建号 / 设置 / MCP Key 等非 run 写入）。
  * 二者都低估真实总量、且互有覆盖关系，取 max 既不会把同一次 run 算两遍，
  * 也不会像纯 isolate 增量那样在 isolate 重启后归零。
+ * 签到时间不在设置里：每个账号各有一个 `checkinHour`（北京时间整点），见 GET /api/accounts。
  * @param {object} ctx
- * @returns {Promise<{retentionRuns:number, checkinHour:number, cronUtc:string, cronLocal:string,
- *                    cronIntervalMinutes:number, kvWritesToday:number}>}
+ * @returns {Promise<{retentionRuns:number, cronIntervalMinutes:number, kvWritesToday:number}>}
  */
 export async function svcSettings(ctx) {
   const [settings, index] = await Promise.all([ctx.kv.getSettings(), ctx.kv.getLogIndex()]);
@@ -402,16 +421,9 @@ export async function svcSettings(ctx) {
       baseline += Number.isFinite(item.kvWriteCount) ? item.kvWriteCount : 0;
     }
   }
-  const hourRaw = Number(settings.checkinHour);
-  const checkinHour = Number.isFinite(hourRaw) ? Math.trunc(hourRaw) : DEFAULT_CHECKIN_HOUR;
-  const cron = deriveCronTexts(checkinHour);
   return {
     retentionRuns: Number.isFinite(settings.retentionRuns) ? settings.retentionRuns : 30,
-    checkinHour,
-    // cronUtc/cronLocal 是「签到小时对应的时刻」，仅用于展示与排错；
-    // 真实部署的表达式固定是 */15 轮询（见 wrangler.toml），不随设置变化。
-    cronUtc: cron.cronUtc,
-    cronLocal: cron.cronLocal,
+    // 部署的 cron 固定每 15 分钟轮询（见 wrangler.toml），不随任何设置变化
     cronIntervalMinutes: CRON_INTERVAL_MINUTES,
     // 近似下界：不能简单相加，否则同一次 run 会被 indexBaseline 与本 isolate 计数各算一遍
     kvWritesToday: Math.max(baseline, ctx.writes()),
@@ -808,43 +820,20 @@ async function evictExcessLogs(ctx, retentionRuns) {
 }
 
 /**
- * PUT /api/settings（auth）：日志保留条数与签到小时，两者都可单独提交。
- * retentionRuns 传了才校验并更新；checkinHour 传了才校验并更新。整批合成 1 次 KV 写。
+ * PUT /api/settings（auth）：目前只有日志保留条数。
+ * 签到时间是**每账号**属性，走 PUT /api/accounts/:id 的 checkinHour 字段。
  * @param {{ctx:object, body:object}} params
  * @returns {Promise<Response>}
  */
 async function handlePutSettings({ ctx, body }) {
-  const src = body && typeof body === 'object' ? body : {};
-  const patch = Object.create(null);
-  let evictionRetention = null;
-
-  if (src.retentionRuns !== undefined) {
-    const retention = typeof src.retentionRuns === 'string' ? Number(src.retentionRuns) : src.retentionRuns;
-    if (!Number.isFinite(retention) || !Number.isInteger(retention) || retention < RETENTION_MIN || retention > RETENTION_MAX) {
-      throw new AppError('BAD_REQUEST', `retentionRuns 必须是 ${RETENTION_MIN}~${RETENTION_MAX} 的整数`);
-    }
-    patch.retentionRuns = retention;
-    evictionRetention = retention;
+  const raw = body ? body.retentionRuns : undefined;
+  const retention = typeof raw === 'string' ? Number(raw) : raw;
+  if (!Number.isFinite(retention) || !Number.isInteger(retention) || retention < RETENTION_MIN || retention > RETENTION_MAX) {
+    throw new AppError('BAD_REQUEST', `retentionRuns 必须是 ${RETENTION_MIN}~${RETENTION_MAX} 的整数`);
   }
-
-  if (src.checkinHour !== undefined) {
-    const hour = typeof src.checkinHour === 'string' ? Number(src.checkinHour) : src.checkinHour;
-    if (!Number.isFinite(hour) || !Number.isInteger(hour) || hour < 0 || hour > 23) {
-      throw new AppError('BAD_REQUEST', 'checkinHour 必须是 0~23 的整数（北京时间整点）');
-    }
-    patch.checkinHour = hour;
-  }
-
-  if (Object.keys(patch).length === 0) {
-    throw new AppError('BAD_REQUEST', '没有需要更新的设置项');
-  }
-
-  await ctx.kv.putSettings(patch);
-  // 只有调低保留条数才需要立即回收；只改签到时间时跳过，避免无谓的读写
-  let eviction = { evicted: 0, failed: false };
-  if (evictionRetention !== null) {
-    eviction = await evictExcessLogs(ctx, evictionRetention);
-  }
+  await ctx.kv.putSettings({ retentionRuns: retention });
+  // 立即回收超额日志（用户主动操作，写入成本可见；避免把淘汰压力推给下一次 run）
+  const eviction = await evictExcessLogs(ctx, retention);
   const view = await svcSettings(ctx);
   return ok({ ...view, evicted: eviction.evicted, evictFailed: eviction.failed });
 }

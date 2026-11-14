@@ -1,16 +1,20 @@
 // src/schedule.js
-// 签到调度：把「每天几点签到」翻译成「这一轮 cron 该不该干活」。
+// 签到调度：把「每个账号各自的签到小时」翻译成「这一轮 cron 该跑哪些账号」。
 //
-// 为什么不是「一个 cron 精确打在 HH:MM」：
-//   Cloudflare Cron 只有到分钟的表达力，但 Worker 的 cron 触发并不保证准点
-//   （边缘调度与实例冷启动都可能带来分钟级延迟），单点触发一旦错过就整天不签。
-//   所以改成 *​/15 高频轮询 + 按「小时」判断归属：
-//     - 目标小时内的 4 次触发（:00 :15 :30 :45）都算这一轮窗口；
-//     - 第一次成功就把结果写进 KV，后面 3 次直接跳过（零写）；
-//     - 第一次失败则后 3 次自动成为重试机会，天然容错。
-//
-// 时区口径：面板上填的是**北京时间（Asia/Shanghai）的小时数**，与 Cron 的 UTC 表达式解耦。
-// 北京不实行夏令时，所以这里不需要处理 DST 跳变。
+// 设计要点：
+//   1. **按账号独立设置**，没有全局签到时间。10 个账号可以分别落在 8、9、10… 点，
+//      避免同一分钟集中打上游（扎堆既像脚本，也容易触发风控）。
+//   2. Cloudflare Cron 只有到分钟的表达力，但触发并不保证准点（边缘调度 + 冷启动
+//      可能带来分钟级延迟），单点触发一旦错过就整天不签。所以 wrangler.toml 固定
+//      `*/15 * * * *` 高频轮询，再按「小时」判断归属：
+//        - 目标小时内的 4 次触发（:00 :15 :30 :45）都算这个窗口；
+//        - 第一次成功就把结果写进 KV，后面 3 次直接跳过（零写）；
+//        - 第一次失败则后 3 次自动成为重试机会，天然容错。
+//   3. **时区**：面板填的是北京时间（Asia/Shanghai）整点，存储的也是北京小时数，
+//      **不做 UTC 存储**，避免来回换算引入错误。Cron 表达式是 UTC，但因为用的是
+//      「每 15 分钟」这种与时区无关的写法，真正的时区转换只发生在
+//      「UTC 时间戳 -> 北京日期/小时」这一步（beijingParts）。
+//      北京不实行夏令时，所以不需要处理 DST 跳变。
 
 /** 视为「今天这个账号已经不用再签」的结果集合。 */
 export const DONE_RESULTS = Object.freeze(['checked_in', 'already_checked_in']);
@@ -18,17 +22,20 @@ export const DONE_RESULTS = Object.freeze(['checked_in', 'already_checked_in']);
 /** 是否属于「已完成」集合。 */
 const DONE_SET = new Set(DONE_RESULTS);
 
-/** 默认签到小时（北京时间 8 点）。 */
+/** 默认签到小时（北京时间 8 点）。账号没设置时回落这个值。 */
 export const DEFAULT_CHECKIN_HOUR = 8;
+
+/** 自动分配签到小时的起点（新账号从 8 点开始往后找空位）。 */
+const HOUR_SEARCH_START = 8;
 
 /** cron 轮询间隔（分钟），与 wrangler.toml 的每 15 分钟轮询保持一致。 */
 export const CRON_INTERVAL_MINUTES = 15;
 
-/** 一天有多少分钟，用于把小时换算成 UTC cron 表达式。 */
-const MINUTES_PER_DAY = 24 * 60;
-
 /**
  * 把毫秒时间戳换算成北京时间的日期与小时。
+ *
+ * 这是全项目**唯一**的 UTC -> 北京时间转换点。云端的 `scheduledTime`、`Date.now()`
+ * 都是 UTC 毫秒，面板上用户填的是北京整点，两边在这里对齐。
  * @param {number} ms
  * @returns {{date:string, hour:number}} date 形如 `2026-11-14`，hour 为 0~23
  */
@@ -60,38 +67,87 @@ export function beijingParts(ms) {
 }
 
 /**
- * 当前这一轮 cron 是否落在配置的签到小时内。
- * @param {{checkinHour?:number}} settings
- * @param {number} ms
- * @returns {boolean}
+ * 严格解析签到小时：只接受 0~23 的整数（也接受纯数字字符串）。
+ * @param {*} value
+ * @returns {number|null} 非法返回 null
  */
-export function isCheckinHour(settings, ms) {
-  const raw = settings && typeof settings === 'object' ? settings.checkinHour : undefined;
-  const target = Number.isFinite(raw) ? Math.trunc(raw) : DEFAULT_CHECKIN_HOUR;
-  return beijingParts(ms).hour === target;
+export function parseCheckinHour(value) {
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+  if (n < 0 || n > 23) return null;
+  return n;
 }
 
 /**
- * 换算某个北京时间小时对应的 UTC cron 表达式（仅用于面板展示与排错）。
- * @param {number} checkinHour 北京时间 0~23
- * @returns {{cronUtc:string, cronLocal:string}}
- */
-export function deriveCronTexts(checkinHour) {
-  const hour = Number.isFinite(checkinHour) ? ((Math.trunc(checkinHour) % 24) + 24) % 24 : DEFAULT_CHECKIN_HOUR;
-  const utcHour = ((hour - 8) % 24 + 24) % 24;
-  return {
-    // 实际部署表达式是高频轮询，这里给出「该小时在 UTC 里对应几点」以便人工核对
-    cronUtc: `${String(utcHour).padStart(2, '0')}:00`,
-    cronLocal: `${String(hour).padStart(2, '0')}:00`,
-  };
-}
-
-/**
- * 把 cron 轮询换算成「每 N 分钟」的表达（供面板与文档展示）。
+ * 读取账号的签到小时，非法/缺失时回落到默认 8 点。
+ * @param {*} value
  * @returns {number}
  */
-export function cronIntervalMinutes() {
-  return CRON_INTERVAL_MINUTES;
+export function normalizeCheckinHour(value) {
+  const parsed = parseCheckinHour(value);
+  return parsed === null ? DEFAULT_CHECKIN_HOUR : parsed;
+}
+
+/**
+ * 给新账号分配一个签到小时：优先用调用方指定的值，否则从 8 点起找第一个未被占用的整点。
+ *
+ * 目的：批量导入 10 个账号时不要全部压在 8 点。规则透明、可预测，用户随时能在卡片上改。
+ * 24 个整点都被占满时回落默认值（超过 24 个账号本就不允许，上限是 10）。
+ * @param {object[]} accounts 现有账号
+ * @param {*} preferred 期望值（非法/缺失则自动分配）
+ * @returns {number}
+ */
+export function pickNextCheckinHour(accounts, preferred) {
+  const explicit = parseCheckinHour(preferred);
+  if (explicit !== null) return explicit;
+  const used = new Set();
+  for (const account of Array.isArray(accounts) ? accounts : []) {
+    if (!account || typeof account !== 'object') continue;
+    if (account.checkinHour === undefined || account.checkinHour === null) continue;
+    used.add(normalizeCheckinHour(account.checkinHour));
+  }
+  for (let i = 0; i < 24; i += 1) {
+    const hour = (HOUR_SEARCH_START + i) % 24;
+    if (!used.has(hour)) return hour;
+  }
+  return DEFAULT_CHECKIN_HOUR;
+}
+
+/**
+ * 这一轮该处理哪些账号：已启用 + 签到小时等于当前北京小时。
+ * @param {object[]} accounts
+ * @param {number} ms
+ * @returns {object[]}
+ */
+export function accountsDueAt(accounts, ms) {
+  const { hour } = beijingParts(ms);
+  return (Array.isArray(accounts) ? accounts : []).filter((account) => {
+    if (!account || typeof account !== 'object') return false;
+    if (account.enabled !== true) return false;
+    if (typeof account.id !== 'string' || !account.id) return false;
+    return normalizeCheckinHour(account.checkinHour) === hour;
+  });
+}
+
+/**
+ * 北京时间整点 -> 展示文本，如 8 -> `08:00`。
+ * @param {number} hour
+ * @returns {string}
+ */
+export function beijingHourText(hour) {
+  return `${String(normalizeCheckinHour(hour)).padStart(2, '0')}:00`;
+}
+
+/**
+ * 北京时间整点 -> 对应的 UTC 整点文本（跨日只关心钟点，便于面板提示）。
+ * 例：北京 08:00 -> UTC 00:00；北京 00:00 -> UTC 16:00（前一日）。
+ * @param {number} hour
+ * @returns {string}
+ */
+export function utcHourText(hour) {
+  const utcHour = ((normalizeCheckinHour(hour) - 8) % 24 + 24) % 24;
+  return `${String(utcHour).padStart(2, '0')}:00`;
 }
 
 /**
@@ -100,7 +156,7 @@ export function cronIntervalMinutes() {
  *   - 当天的记录日期不是今天 -> 全部待签；
  *   - 是今天 -> 排除已成功（checked_in / already_checked_in）的账号；
  *   - 失败结果不写入记录，所以失败账号天然会被重试。
- * @param {object[]} accounts 已启用账号
+ * @param {object[]} accounts 本轮到点的账号
  * @param {{date?:string, accounts?:Record<string,{result?:string}>}|null} dayRecord
  * @param {string} date 北京时间日期 `YYYY-MM-DD`
  * @returns {string[]}
@@ -148,8 +204,8 @@ export function mergeDayRecord(dayRecord, date, entries, nowIso) {
 }
 
 /**
- * 当日记录是否已经覆盖所有启用账号（用于「零写提前返回」）。
- * @param {object[]} accounts 已启用账号
+ * 当日记录是否已经覆盖所有给定账号（用于「零写提前返回」）。
+ * @param {object[]} accounts 本轮到点的账号
  * @param {{date?:string, accounts?:object}|null} dayRecord
  * @param {string} date
  * @returns {boolean}
@@ -162,6 +218,3 @@ export function isDayComplete(accounts, dayRecord, date) {
 export function isDoneResult(result) {
   return DONE_SET.has(result);
 }
-
-/** 一天分钟数常量导出（测试与文档用）。 */
-export { MINUTES_PER_DAY };

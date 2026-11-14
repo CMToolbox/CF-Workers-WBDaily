@@ -11,6 +11,7 @@
 // 安全：导入结果只返回计数；导出含明文 token，仅允许已登录管理员调用，且不写日志。
 
 import { AppError, newAccountId, sanitizeToken, sha256Hex, truncate } from './util.js';
+import { parseCheckinHour, pickNextCheckinHour } from './schedule.js';
 
 const NAME_MAX = 32;
 const UID_MAX = 64;
@@ -84,6 +85,13 @@ export function normalizeImportItem(raw, index = 0) {
   const enterpriseRaw = raw.enterprise_id ?? raw.enterpriseId;
   const enterpriseId = typeof enterpriseRaw === 'string' ? enterpriseRaw.trim().slice(0, UID_MAX) : '';
 
+  // 每账号签到小时（北京时间整点）：cockpit 导出里没有这个字段，本系统导出时带上便于备份恢复
+  const checkinHourRaw = raw.checkin_hour ?? raw.checkinHour;
+  const checkinHour = parseCheckinHour(checkinHourRaw);
+  if (checkinHourRaw !== undefined && checkinHourRaw !== null && checkinHourRaw !== '' && checkinHour === null) {
+    return { ok: false, reason: `第 ${index + 1} 条 checkin_hour 必须是 0~23 的整数` };
+  }
+
   const nick = typeof raw.nickname === 'string' ? raw.nickname.trim() : '';
   const email = typeof raw.email === 'string' ? raw.email.trim() : '';
   const name = truncate(nick || email || `导入账号 ${index + 1}`, NAME_MAX);
@@ -93,6 +101,7 @@ export function normalizeImportItem(raw, index = 0) {
   if (refreshToken) item.refreshToken = refreshToken;
   if (domain) item.domain = domain;
   if (enterpriseId) item.enterpriseId = enterpriseId;
+  if (checkinHour !== null) item.checkinHour = checkinHour;
   return { ok: true, item };
 }
 
@@ -182,6 +191,8 @@ export function mergeImportedAccounts(existing, incoming, options) {
       uid: item.uid,
       enabled: true,
       remark: '',
+      // 没带时间就自动挑一个空位；批量导入 10 个账号会落到 8、9、10… 点，不会扎堆
+      checkinHour: pickNextCheckinHour(accounts, item.checkinHour),
       createdAt: nowIso,
       updatedAt: nowIso,
     };
@@ -231,6 +242,7 @@ export async function buildCockpitExport(accounts, nowMs) {
     if (account.uid) row.uid = account.uid;
     if (account.domain) row.domain = account.domain;
     if (account.enterpriseId) row.enterprise_id = account.enterpriseId;
+    if (Number.isInteger(account.checkinHour)) row.checkin_hour = account.checkinHour;
     if (account.name) row.nickname = account.name;
     result.push(row);
   }

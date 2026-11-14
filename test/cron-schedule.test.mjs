@@ -55,19 +55,65 @@ function okUpstream() {
   });
 }
 
-test('非签到小时：只读 settings，零 KV 写、零上游请求', async () => {
+test('没有账号到点：只读 accounts，零 KV 写、零上游请求', async () => {
   const kv = createMemoryKv();
-  kv.seed('accounts', [makeAccount(1)]);
+  kv.seed('accounts', [makeAccount(1)]); // 默认 8 点
   kv.resetEvents();
   const upstream = okUpstream();
 
-  // 北京 07:00（UTC 前一日 23:00），默认签到小时是 8
+  // 北京 07:00（UTC 前一日 23:00），没有任何账号设在这个小时
   await runCron(kv, Date.UTC(2026, 10, 13, 23, 0, 0), upstream);
 
-  assert.equal(kv.writeCount(), 0, '非签到小时不允许任何写');
-  assert.equal(upstream.calls.length, 0, '非签到小时不允许打上游');
-  // 只读了 settings 一次
-  assert.deepEqual(kv.reads().map((event) => event.key), ['config:settings']);
+  assert.equal(kv.writeCount(), 0, '无到点账号时不允许任何写');
+  assert.equal(upstream.calls.length, 0, '无到点账号时不允许打上游');
+  // 只读了 accounts 一次
+  assert.deepEqual(kv.reads().map((event) => event.key), ['accounts']);
+});
+
+test('每个账号按自己的小时签到：8 点只跑 A，9 点只跑 B', async () => {
+  const kv = createMemoryKv();
+  kv.seed('accounts', [
+    { ...makeAccount(1), checkinHour: 8 },
+    { ...makeAccount(2), checkinHour: 9 },
+  ]);
+
+  // 08:00：只应请求 acc_1
+  const at8 = okUpstream();
+  await runCron(kv, BEIJING_8AM, at8);
+  assert.equal(at8.tokens().every((token) => token.includes('token-1')), true, '08:00 不应碰 9 点的账号');
+
+  const day = kv.json('checkin:day');
+  assert.deepEqual(Object.keys(day.accounts), ['acc_1']);
+
+  // 09:00：只应请求 acc_2
+  kv.resetEvents();
+  const at9 = okUpstream();
+  await runCron(kv, BEIJING_8AM + HOUR, at9);
+  assert.ok(at9.calls.length > 0);
+  assert.equal(at9.tokens().every((token) => token.includes('token-2')), true, '09:00 不应重复请求 8 点的账号');
+  assert.deepEqual(Object.keys(kv.json('checkin:day').accounts).sort(), ['acc_1', 'acc_2']);
+});
+
+test('把账号的签到时间改到别的小时后，原小时不再触发', async () => {
+  const kv = createMemoryKv();
+  kv.seed('accounts', [{ ...makeAccount(1), checkinHour: 8 }]);
+
+  // 08:00 签到成功
+  await runCron(kv, BEIJING_8AM, okUpstream());
+  assert.ok(kv.json('checkin:day'));
+
+  // 用户把时间改到 9 点，并清掉昨日进度
+  kv.seed('accounts', [{ ...makeAccount(1), checkinHour: 9 }]);
+  kv.seed('checkin:day', null);
+
+  kv.resetEvents();
+  const stillAt8 = okUpstream();
+  await runCron(kv, BEIJING_8AM, stillAt8);
+  assert.equal(stillAt8.calls.length, 0, '改到 9 点后 8 点不应再跑');
+
+  const at9 = okUpstream();
+  await runCron(kv, BEIJING_8AM + HOUR, at9);
+  assert.ok(at9.calls.length > 0, '9 点应正常触发');
 });
 
 test('签到小时首次触发：跑一轮签到并把成功结果写入 checkin:day', async () => {

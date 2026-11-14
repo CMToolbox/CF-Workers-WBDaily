@@ -15,6 +15,7 @@ const ICONS = Object.freeze({
   trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>',
   upload: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/></svg>',
   download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>',
 });
 
 /** Asia/Shanghai 时间格式（月/日 时:分）。 */
@@ -65,7 +66,7 @@ const state = {
     key: false,
     pw: false,
     retention: false,
-    checkinHour: false,
+    hour: null,
     setup: false,
     login: false,
   },
@@ -176,7 +177,63 @@ function tokenStateRow(account) {
   } else {
     row.appendChild(el('span', 'badge badge-warn', '缺 refresh_token'));
   }
+  row.appendChild(checkinHourPicker(account));
   return row;
+}
+
+/**
+ * 卡片上的「签到时间」下拉（北京时间整点，每账号独立）。
+ *
+ * 不用打开编辑弹窗才能改：签到时间是高频调整项，且用户需要一眼看出「我的账号是不是都堆在同一小时」。
+ * 改动即时 PUT /api/accounts/:id，无需重新部署；title 里同时给出对应的 UTC 时刻，避免用户自己换算。
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function checkinHourPicker(account) {
+  const hour = Number.isInteger(account.checkinHour) ? account.checkinHour : 8;
+  const select = el('select', 'input input-sm acc-hour-select');
+  select.setAttribute('aria-label', `账号 ${account.name} 的签到时间（北京时间）`);
+  for (let h = 0; h < 24; h += 1) {
+    const option = document.createElement('option');
+    option.value = String(h);
+    option.textContent = `每天 ${String(h).padStart(2, '0')}:00`;
+    select.appendChild(option);
+  }
+  select.value = String(hour);
+  select.disabled = state.busy.hour === account.id;
+  select.title = `北京时间 ${String(hour).padStart(2, '0')}:00（UTC ${String(((hour - 8) % 24 + 24) % 24).padStart(2, '0')}:00）`;
+  select.addEventListener('change', () => {
+    const next = Number(select.value);
+    if (!Number.isInteger(next) || next === hour) {
+      select.value = String(hour);
+      return;
+    }
+    void saveAccountHour(account, next);
+  });
+  return select;
+}
+
+/**
+ * 保存单个账号的签到时间。
+ * @param {object} account
+ * @param {number} hour 北京时间 0~23
+ */
+async function saveAccountHour(account, hour) {
+  // 不做请求前的全量重渲染：那会让下拉在请求期间闪回旧值。失败时 finally 里的
+  // refreshAccounts 会把选择恢复成服务端的真实值。
+  state.busy.hour = account.id;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'PUT', body: { checkinHour: hour } });
+    toast(`「${account.name}」改为每天 ${String(hour).padStart(2, '0')}:00（北京时间）签到`, 'ok');
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      setError(err.code || 'INTERNAL', err.message || '保存签到时间失败');
+      toast('保存失败', 'bad');
+    }
+  } finally {
+    state.busy.hour = null;
+    await refreshAccounts();
+  }
 }
 
 /** @param {string} iso @returns {string} */
@@ -367,6 +424,11 @@ function latestResultFor(accountId) {
 }
 
 function renderAccounts() {
+  // 全量重建 DOM。若用户正打开着某个「签到时间」下拉（30s 轮询会触发重建），
+  // 重建会把下拉关掉、选择丢失，所以这次刷新直接让路，等下一轮。
+  const focused = document.activeElement;
+  if (focused && focused.classList && focused.classList.contains('acc-hour-select')) return;
+
   const list = $('#accounts-list');
   const skeleton = $('#accounts-skeleton');
   const empty = $('#accounts-empty');
@@ -790,10 +852,6 @@ function renderSettings() {
   const settings = state.settings;
   if (settings) {
     $('#retention-input').value = String(settings.retentionRuns);
-    const hour = Number.isFinite(Number(settings.checkinHour)) ? Number(settings.checkinHour) : 8;
-    $('#checkin-hour-select').value = String(hour);
-    $('#cron-local').textContent = settings.cronLocal || '08:00';
-    $('#cron-utc').textContent = settings.cronUtc || '00:00';
   }
   $('#settings-version').textContent = state.version || '1.0.0';
 
@@ -817,8 +875,8 @@ function syncBusy() {
 
   $('#btn-refresh').disabled = state.busy.run;
   $('#btn-add-account').disabled = state.busy.run;
+  $('#btn-spread-hours').disabled = state.busy.run || state.busy.hour === 'spread';
   $('#btn-save-retention').disabled = state.busy.retention;
-  $('#btn-save-checkin-hour').disabled = state.busy.checkinHour;
   $('#btn-gen-mcp').disabled = state.busy.key;
   $('#btn-change-pw').disabled = state.busy.pw;
   $('#btn-setup').disabled = state.busy.setup;
@@ -1604,45 +1662,45 @@ async function saveRetention() {
 }
 
 /**
- * 初始化「签到时间」下拉（0~23 整点，北京时间）。
- * 只在首次渲染时填充一次，避免每次 renderSettings 重建 DOM 丢掉用户的选择。
+ * 一键错开：把「启用」账号的签到时间按当前顺序排成 08:00、09:00、10:00…
+ *
+ * 解决的是存量账号问题：旧版本没有 checkinHour 字段，全部回落到 8 点，反而扎堆。
+ * 只有时间确实不同的账号才发请求，避免无意义的整表写。
  */
-function initCheckinHourOptions() {
-  const select = $('#checkin-hour-select');
-  if (!select || select.options.length > 0) return;
-  for (let hour = 0; hour < 24; hour += 1) {
-    const option = document.createElement('option');
-    option.value = String(hour);
-    option.textContent = `${String(hour).padStart(2, '0')}:00`;
-    select.appendChild(option);
-  }
-}
-
-/**
- * 保存「签到时间」。
- * 只提交 checkinHour，不动 retentionRuns：后端已把两个字段改成各自可选，
- * 避免为了改时间顺带重算日志淘汰。
- */
-async function saveCheckinHour() {
-  const hour = Number($('#checkin-hour-select').value);
-  const hint = $('#checkin-hour-hint');
-  hint.hidden = true;
-  if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
-    setError('BAD_REQUEST', '签到时间需为 0~23 的整点');
+async function spreadCheckinHours() {
+  const targets = state.accounts.filter((account) => account.enabled === true);
+  if (targets.length === 0) {
+    toast('没有启用的账号', 'warn');
     return;
   }
-  state.busy.checkinHour = true;
+  const plan = targets.map((account, index) => ({
+    account,
+    hour: (8 + index) % 24,
+  })).filter((item) => item.account.checkinHour !== item.hour);
+  if (plan.length === 0) {
+    toast('签到时间已经是错开的，无需调整', 'ok');
+    return;
+  }
+
+  state.busy.hour = 'spread';
   syncBusy();
   try {
-    state.settings = await api('/api/settings', { method: 'PUT', body: { checkinHour: hour } });
-    renderSettings();
-    hint.hidden = false;
-    toast(`签到时间已设为每天 ${String(hour).padStart(2, '0')}:00（北京时间）`, 'ok');
+    // 串行执行：每个账号一次 PUT，后端每次整表写一遍 KV，串行不会互相覆盖
+    for (const item of plan) {
+      await api(`/api/accounts/${encodeURIComponent(item.account.id)}`, {
+        method: 'PUT',
+        body: { checkinHour: item.hour },
+      });
+    }
+    toast(`已为 ${plan.length} 个账号错开签到时间（08:00 起依次顺延）`, 'ok');
   } catch (err) {
-    if (!(err instanceof ApiError) || err.status !== 401) setError(err.code || 'INTERNAL', err.message || '保存失败');
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      setError(err.code || 'INTERNAL', err.message || '错开签到时间失败');
+    }
   } finally {
-    state.busy.checkinHour = false;
+    state.busy.hour = null;
     syncBusy();
+    await refreshAccounts();
   }
 }
 
@@ -1790,14 +1848,13 @@ function bindEvents() {
     toast('已刷新', 'info');
   });
   $('#btn-run-all').addEventListener('click', runAll);
+  $('#btn-spread-hours').addEventListener('click', spreadCheckinHours);
   $('#btn-add-account').addEventListener('click', () => openAccountDialog(null));
   $('#btn-import-accounts').addEventListener('click', () => $('#import-file').click());
   $('#import-file').addEventListener('change', onImportFile);
   $('#btn-export-accounts').addEventListener('click', askExportAccounts);
   $('#btn-clear-logs').addEventListener('click', askClearLogs);
   $('#btn-save-retention').addEventListener('click', saveRetention);
-  initCheckinHourOptions();
-  $('#btn-save-checkin-hour').addEventListener('click', saveCheckinHour);
   $('#btn-gen-mcp').addEventListener('click', () => requestMcpKey(Boolean(state.mcpKey && state.mcpKey.exists)));
   $('#btn-change-pw').addEventListener('click', changePassword);
   $('#btn-copy-key').addEventListener('click', copyMcpKey);

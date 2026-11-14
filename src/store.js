@@ -20,11 +20,8 @@ export const KV_KEYS = Object.freeze({
 
 /** settings 默认值（getSettings 会与存储值做浅合并）。 */
 export const DEFAULT_SETTINGS = Object.freeze({
+  // 签到时间不在这里：每个账号各有自己的 checkinHour，见 schedule.js
   retentionRuns: 30,
-  // 签到小时（北京时间 0~23）。cron 每 15 分钟轮询，只有落在这个小时里的触发才真正干活。
-  checkinHour: 8,
-  cronUtc: '01:00',
-  cronLocal: '09:00',
 });
 
 /** P0 账号上限（同时保护单键值体积）。 */
