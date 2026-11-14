@@ -1,20 +1,32 @@
 // public/app.js
 // 零构建原生前端：单 state + 全量 render，无框架 / 无 CDN / 无内联事件。
 // 安全约定：所有来自服务端或用户的文本一律走 textContent；
-// innerHTML 只用于下面 ICONS 里的静态 SVG 常量（不含任何动态数据）。
+// innerHTML 只用于本地静态常量（图标 symbol id 映射）。
+//
+// 分层（顺序不可打乱）：
+//   state → 格式化/小工具 → 渲染层（render*） → 网络层（api） → 数据加载（load*） → 动作 → 事件绑定
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
-/** 静态 SVG 图标（纯常量，绝不含用户输入）。 */
+/**
+ * 图标 symbol id 映射（值与 index.html 里的 <symbol id="…"> 一一对应）。
+ * 只做 id 映射，不再持有 24×24 path：静态 HTML 与动态渲染必须共用同一套描边风格。
+ */
 const ICONS = Object.freeze({
-  plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-  play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l12 8-12 8z"/></svg>',
-  refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 10-3.2 6.4"/><path d="M20 5v6h-6"/></svg>',
-  edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16z"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>',
-  upload: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/></svg>',
-  download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>',
+  plus: 'i-plus',
+  play: 'i-play',
+  refresh: 'i-refresh',
+  edit: 'i-edit',
+  trash: 'i-trash',
+  upload: 'i-upload',
+  download: 'i-download',
+  chev: 'i-chev',
+  check: 'i-check',
+  search: 'i-search',
+  users: 'i-users',
+  clock: 'i-clock',
+  coins: 'i-coins',
 });
 
 /** Asia/Shanghai 时间格式（月/日 时:分）。 */
@@ -22,6 +34,14 @@ const TIME_FMT = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai',
   month: '2-digit',
   day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+/** 只有时:分（Asia/Shanghai，用于「今天 09:00」）。 */
+const CLOCK_FMT = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
   hour: '2-digit',
   minute: '2-digit',
   hour12: false,
@@ -41,15 +61,58 @@ const DATETIME_FMT = new Intl.DateTimeFormat('zh-CN', {
   hour12: false,
 });
 
+/** 栏目（分页）名称 + 标题。 */
+const PAGES = Object.freeze({ accounts: '账号概览', logs: '执行记录', settings: '设置' });
+
+/** 默认文档标题（登出 / 非面板视图时复原）。 */
+const DEFAULT_TITLE = 'WorkBuddy Daily · 自动签到';
+
+/** localStorage 包装：隐私模式下 localStorage 会抛，一律吞掉。 */
+const store = {
+  /**
+   * @param {string} key
+   * @returns {string|null}
+   */
+  get(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  /**
+   * @param {string} key
+   * @param {string} value
+   */
+  set(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch {
+      /* 隐私模式 / 配额满：静默忽略，功能不降级 */
+    }
+  },
+};
+
 /** 全局状态（唯一真相，驱动全量渲染）。 */
 const state = {
   view: 'boot',
+  /** 面板栏目：'accounts' | 'logs' | 'settings'（与 state.view 是两个维度，不要混用） */
+  page: 'accounts',
+  /** 账号展示方式：'cards' | 'list' */
+  accView: 'list',
+  /** 当前主题：'dark' | 'light' */
+  theme: 'dark',
+  /** bootstrap 快照：{ initialized, version, setupTokenRequired } */
+  bootstrap: null,
   accounts: [],
   logs: [],
   settings: null,
   mcpKey: null,
   opened: {},
   details: {},
+  /** 列表视图行展开：{ [accountId]: true } */
+  expanded: {},
+  /** 日志过滤器：仅失败 + 关键词（账号列表不再提供搜索入口） */
   filters: { onlyFailed: false, q: '' },
   error: null,
   authError: null,
@@ -90,7 +153,7 @@ class ApiError extends Error {
  * 创建元素。
  * @param {string} tag
  * @param {string} [className]
- * @param {string} [text]
+ * @param {string|number} [text]
  * @returns {HTMLElement}
  */
 function el(tag, className, text) {
@@ -101,33 +164,29 @@ function el(tag, className, text) {
 }
 
 /**
- * 生成图标元素（静态 SVG 常量）。
- * @param {'plus'|'play'|'refresh'|'edit'|'trash'} name
- * @returns {HTMLElement}
+ * 生成图标元素（引用 index.html 的 symbol 精灵，零内联 path）。
+ * @param {keyof typeof ICONS|string} name
+ * @returns {SVGElement}
  */
 function icon(name) {
-  const span = el('span', 'icon');
-  span.setAttribute('aria-hidden', 'true');
-  span.innerHTML = ICONS[name] || ''; // 静态常量，不含任何用户输入
-  return span;
-}
-
-/**
- * 把静态 HTML 中的 data-icon 占位替换成 SVG。
- */
-function hydrateStaticIcons() {
-  for (const node of $$('[data-icon]')) {
-    node.innerHTML = ICONS[node.dataset.icon] || ''; // 静态常量，不含任何用户输入
-  }
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'ic');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', `#${ICONS[name] || ICONS.plus}`);
+  svg.appendChild(use);
+  return svg;
 }
 
 /**
  * 重设按钮内容（图标 + 文案）。
- * @param {HTMLElement} button
+ * @param {HTMLElement|null} button
  * @param {string|null} iconName
  * @param {string} label
  */
 function setButtonContent(button, iconName, label) {
+  if (!button) return;
   button.textContent = '';
   if (iconName) button.appendChild(icon(iconName));
   button.appendChild(document.createTextNode(label));
@@ -143,95 +202,6 @@ function formatClock(ms) {
   const hh = String(date.getHours()).padStart(2, '0');
   const mm = String(date.getMinutes()).padStart(2, '0');
   return `${hh}:${mm}`;
-}
-
-/**
- * token 生命周期行。
- *
- * WorkBuddy 的 access_token 只有 3600 秒有效期，光看一个打码的 token 完全判断不出
- * 「为什么昨天还能用今天就不行」。这里把两件事直接摆出来：
- *   1. 现在还剩多久（已过期 / N 分钟后过期 / 有效至 HH:MM）；
- *   2. 过期后能不能自己续（有没有保存 refresh_token）。
- * @param {object} account
- * @returns {HTMLElement}
- */
-function tokenStateRow(account) {
-  const row = el('div', 'acc-token-state');
-  const expMs = account.tokenExpiresAt ? Date.parse(account.tokenExpiresAt) : NaN;
-  if (Number.isFinite(expMs)) {
-    const leftMs = expMs - Date.now();
-    if (leftMs <= 0) {
-      row.appendChild(el('span', 'badge badge-bad', 'Token 已过期'));
-    } else if (leftMs <= 10 * 60 * 1000) {
-      row.appendChild(el('span', 'badge badge-warn', `Token ${Math.max(1, Math.ceil(leftMs / 60000))} 分钟后过期`));
-    } else {
-      row.appendChild(el('span', 'badge badge-mute', `Token 有效至 ${formatClock(expMs)}`));
-    }
-  } else {
-    row.appendChild(el('span', 'badge badge-mute', 'Token 有效期未知'));
-  }
-  if (account.hasRefreshToken) {
-    row.appendChild(el('span', 'badge badge-ok', '可自动续期'));
-  } else {
-    row.appendChild(el('span', 'badge badge-warn', '缺 refresh_token'));
-  }
-  row.appendChild(checkinHourPicker(account));
-  return row;
-}
-
-/**
- * 卡片上的「签到时间」下拉（北京时间整点，每账号独立）。
- *
- * 不用打开编辑弹窗才能改：签到时间是高频调整项，且用户需要一眼看出「我的账号是不是都堆在同一小时」。
- * 改动即时 PUT /api/accounts/:id，无需重新部署；title 里同时给出对应的 UTC 时刻，避免用户自己换算。
- * @param {object} account
- * @returns {HTMLElement}
- */
-function checkinHourPicker(account) {
-  const hour = Number.isInteger(account.checkinHour) ? account.checkinHour : 8;
-  const select = el('select', 'input input-sm acc-hour-select');
-  select.setAttribute('aria-label', `账号 ${account.name} 的签到时间（北京时间）`);
-  for (let h = 0; h < 24; h += 1) {
-    const option = document.createElement('option');
-    option.value = String(h);
-    option.textContent = `每天 ${String(h).padStart(2, '0')}:00`;
-    select.appendChild(option);
-  }
-  select.value = String(hour);
-  select.disabled = state.busy.hour === account.id;
-  select.title = `北京时间 ${String(hour).padStart(2, '0')}:00（UTC ${String(((hour - 8) % 24 + 24) % 24).padStart(2, '0')}:00）`;
-  select.addEventListener('change', () => {
-    const next = Number(select.value);
-    if (!Number.isInteger(next) || next === hour) {
-      select.value = String(hour);
-      return;
-    }
-    void saveAccountHour(account, next);
-  });
-  return select;
-}
-
-/**
- * 保存单个账号的签到时间。
- * @param {object} account
- * @param {number} hour 北京时间 0~23
- */
-async function saveAccountHour(account, hour) {
-  // 不做请求前的全量重渲染：那会让下拉在请求期间闪回旧值。失败时 finally 里的
-  // refreshAccounts 会把选择恢复成服务端的真实值。
-  state.busy.hour = account.id;
-  try {
-    await api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'PUT', body: { checkinHour: hour } });
-    toast(`「${account.name}」改为每天 ${String(hour).padStart(2, '0')}:00（北京时间）签到`, 'ok');
-  } catch (err) {
-    if (!(err instanceof ApiError) || err.status !== 401) {
-      setError(err.code || 'INTERNAL', err.message || '保存签到时间失败');
-      toast('保存失败', 'bad');
-    }
-  } finally {
-    state.busy.hour = null;
-    await refreshAccounts();
-  }
 }
 
 /** @param {string} iso @returns {string} */
@@ -264,182 +234,30 @@ function fmtDuration(ms) {
 }
 
 /**
- * 结果 -> 徽标。
- * @param {string|null} result
- * @returns {HTMLElement}
- */
-function resultBadge(result) {
-  const map = {
-    checked_in: ['签到成功', 'badge-ok'],
-    already_checked_in: ['今日已签', 'badge-info'],
-    failed: ['失败', 'badge-bad'],
-    skipped_disabled: ['已跳过', 'badge-warn'],
-    dry_run_ok: ['可签到', 'badge-info'],
-  };
-  const hit = map[result];
-  if (!hit) return el('span', 'badge badge-mute', '未跑过');
-  return el('span', `badge ${hit[1]}`, hit[0]);
-}
-
-/** @param {string} trigger @returns {HTMLElement} */
-function triggerBadge(trigger) {
-  const map = { cron: ['定时', 'badge-info'], manual: ['手动', 'badge-ok'], 'manual-single': ['单账号', 'badge-warn'] };
-  const hit = map[trigger] || [String(trigger || '未知'), 'badge-mute'];
-  return el('span', `badge ${hit[1]} badge-trigger`, hit[0]);
-}
-
-// ============ 视图与提示 ============
-
-/**
- * 切换视图（setup / login / panel）。
- * @param {'setup'|'login'|'panel'|'boot'} name
- */
-function showView(name) {
-  state.view = name;
-  const views = { setup: '#view-setup', login: '#view-login', panel: '#view-panel' };
-  for (const [key, selector] of Object.entries(views)) {
-    const node = $(selector);
-    if (node) node.hidden = key !== name;
-  }
-  if (name === 'login') $('#login-password').focus();
-  if (name === 'setup') $('#setup-password').focus();
-}
-
-/** @param {string} code @param {string} message */
-function setError(code, message) {
-  state.error = { code, message };
-  renderError();
-}
-
-function clearError() {
-  state.error = null;
-  renderError();
-}
-
-/** @param {string} code @param {string} message */
-function setAuthError(code, message) {
-  state.authError = { code, message };
-  renderAuthError();
-}
-
-function clearAuthError() {
-  state.authError = null;
-  renderAuthError();
-}
-
-/**
- * 显示 toast（同一文案去重，最多同时 3 条，始终固定在底部）。
- * @param {string} message
- * @param {'ok'|'bad'|'warn'|'info'} [kind]
- */
-function toast(message, kind = 'info') {
-  const host = $('#toast-host');
-  const text = String(message);
-  // 去重：相同文案不叠加（连点按钮不会堆出一列胶囊）
-  for (const existing of Array.from(host.children)) {
-    if (existing.dataset.message === text) {
-      existing.remove();
-    }
-  }
-  while (host.children.length >= 3) {
-    host.firstElementChild.remove();
-  }
-  const node = el('div', `toast is-${kind}`, text);
-  node.dataset.message = text;
-  host.appendChild(node);
-  window.setTimeout(() => node.remove(), 4200);
-}
-
-// ============ 渲染 ============
-
-function renderAll() {
-  renderError();
-  renderAuthError();
-  renderAccounts();
-  renderLogs();
-  renderSettings();
-  syncBusy();
-}
-
-function renderError() {
-  const bar = $('#panel-error');
-  const text = $('#panel-error-text');
-  if (!state.error) {
-    bar.hidden = true;
-    text.textContent = '';
-    return;
-  }
-  text.textContent = `${state.error.code}: ${state.error.message}`;
-  bar.hidden = false;
-}
-
-function renderAuthError() {
-  const setupError = $('#setup-error');
-  const loginError = $('#login-error');
-  if (state.view === 'setup') {
-    setupError.hidden = !state.authError;
-    setupError.textContent = state.authError ? state.authError.message : '';
-  } else {
-    setupError.hidden = true;
-  }
-  if (state.view === 'login') {
-    loginError.hidden = !state.authError;
-    loginError.textContent = state.authError ? state.authError.message : '';
-  } else {
-    loginError.hidden = true;
-  }
-}
-
-/** @param {string} accountId @returns {string} */
-function accountName(accountId) {
-  const hit = state.accounts.find((account) => account.id === accountId);
-  return hit ? hit.name : '';
-}
-
-/**
- * 找某账号最近一次结果（依赖 RunSummary.accountResults，零额外读）。
- * @param {string} accountId
- * @returns {string|null}
- */
-function latestResultFor(accountId) {
-  for (const run of state.logs) {
-    const results = Array.isArray(run.accountResults) ? run.accountResults : [];
-    const hit = results.find((item) => item && item.accountId === accountId);
-    if (hit) return hit.result;
-  }
-  return null;
-}
-
-function renderAccounts() {
-  // 全量重建 DOM。若用户正打开着某个「签到时间」下拉（30s 轮询会触发重建），
-  // 重建会把下拉关掉、选择丢失，所以这次刷新直接让路，等下一轮。
-  const focused = document.activeElement;
-  if (focused && focused.classList && focused.classList.contains('acc-hour-select')) return;
-
-  const list = $('#accounts-list');
-  const skeleton = $('#accounts-skeleton');
-  const empty = $('#accounts-empty');
-  list.textContent = '';
-  $('#accounts-count').textContent = String(state.accounts.length);
-
-  const loading = state.loading.accounts && state.accounts.length === 0;
-  skeleton.hidden = !loading;
-  empty.hidden = loading || state.accounts.length > 0;
-
-  for (const account of state.accounts) {
-    list.appendChild(accountCard(account));
-  }
-}
-
-/**
- * 积分数字格式化。
+ * 积分数字格式化。null / undefined / 空串一律 「—」（不能因为 Number(null) === 0 而显示 0）。
  * @param {number|null|undefined} value
  * @returns {string}
  */
 function fmtCredits(value) {
+  if (value === null || value === undefined || value === '') return '—';
   const number = Number(value);
   if (!Number.isFinite(number)) return '—';
   return CREDIT_FMT.format(number);
+}
+
+/**
+ * 「今天 09:00 / 昨天 09:00 / 11-12 09:00」——最近签到时刻，口径固定 Asia/Shanghai。
+ * @param {string} iso
+ * @returns {string}
+ */
+function fmtDayTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  const stamp = fmtDateStamp(date);
+  const clock = CLOCK_FMT.format(date);
+  if (stamp === fmtDateStamp()) return `今天 ${clock}`;
+  if (stamp === fmtDateStamp(new Date(Date.now() - 86400000))) return `昨天 ${clock}`;
+  return fmtTime(iso);
 }
 
 /**
@@ -455,7 +273,7 @@ function fmtDateTime(iso) {
 }
 
 /**
- * 上海时区日期戳 YYYY-MM-DD（用于导出文件名）。
+ * 上海时区日期戳 YYYY-MM-DD（用于导出文件名与「今天」判定）。
  * @param {Date} [date]
  * @returns {string}
  */
@@ -467,10 +285,20 @@ function fmtDateStamp(date = new Date()) {
   return `${pick('year')}-${pick('month')}-${pick('day')}`;
 }
 
+/** 北京时间整点 -> 'HH:00'。@param {number} hour @returns {string} */
+function fmtHour(hour) {
+  const value = Number(hour);
+  if (!Number.isInteger(value)) return '—';
+  return `${String(((value % 24) + 24) % 24).padStart(2, '0')}:00`;
+}
+
 /**
  * 把账号名转成文件名安全片段：替换 Windows/macOS 非法字符与控制字符为 `_`，
  * 去掉首尾空白与点（Windows 不允许文件名以点结尾），保留中文。
  * 清理后为空则回退为账号 id。
+ *
+ * ⚠ 不可改：test/frontend-filename.test.mjs 用正则从本文件原样抽取本函数并在沙箱求值，
+ * 函数体内不得出现**列 0 的 `}`**，签名与 `.slice(0, 64)` 必须原样。
  * @param {string} name 账号名
  * @param {string} fallback 兜底值（账号 id）
  * @returns {string}
@@ -504,7 +332,650 @@ function downloadJson(filename, data) {
 }
 
 /**
+ * 结果 -> 徽标。
+ * @param {string|null} result
+ * @returns {HTMLElement}
+ */
+function resultBadge(result) {
+  const map = {
+    checked_in: ['签到成功', 'badge-ok'],
+    already_checked_in: ['今日已签', 'badge-info'],
+    failed: ['失败', 'badge-bad'],
+    skipped_disabled: ['已跳过', 'badge-warn'],
+    dry_run_ok: ['可签到', 'badge-info'],
+  };
+  const hit = map[result];
+  if (!hit) return el('span', 'badge badge-mute', '未跑过');
+  return el('span', `badge ${hit[1]}`, hit[0]);
+}
+
+/** @param {string} trigger @returns {HTMLElement} */
+function triggerBadge(trigger) {
+  const map = { cron: ['定时', 'badge-info'], manual: ['手动', 'badge-ok'], 'manual-single': ['单账号', 'badge-warn'] };
+  const hit = map[trigger] || [String(trigger || '未知'), 'badge-mute'];
+  return el('span', `badge ${hit[1]}`, hit[0]);
+}
+
+/**
+ * token 生命周期摘要（卡片与列表共用）。
+ * @param {object} account
+ * @returns {{text:string, tone:'ok'|'warn'|'bad'|'mute'}}
+ */
+function tokenState(account) {
+  const expMs = account.tokenExpiresAt ? Date.parse(account.tokenExpiresAt) : NaN;
+  const parts = [];
+  let tone = 'mute';
+  if (Number.isFinite(expMs)) {
+    const leftMs = expMs - Date.now();
+    if (leftMs <= 0) {
+      parts.push('已过期');
+      tone = 'bad';
+    } else if (leftMs <= 10 * 60 * 1000) {
+      parts.push(`${Math.max(1, Math.ceil(leftMs / 60000))} 分钟后过期`);
+      tone = 'warn';
+    } else {
+      parts.push(`有效至 ${fmtTime(account.tokenExpiresAt)}`);
+      tone = 'ok';
+    }
+  } else {
+    parts.push('有效期未知');
+  }
+  if (account.hasRefreshToken) {
+    parts.push('可自动续期');
+  } else {
+    parts.push('缺 refresh_token');
+    if (tone !== 'bad') tone = 'warn';
+  }
+  return { text: parts.join(' · '), tone };
+}
+
+/**
+ * 账号状态徽标：禁用 > token 失效 > 最近一次 run 的结果。
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function statusBadge(account) {
+  if (account.enabled !== true) return el('span', 'badge badge-mute', '已禁用');
+  const entry = state.credits[account.id];
+  if (entry && entry.error && entry.error.tokenInvalid === true) {
+    return el('span', 'badge badge-bad', 'token 失效');
+  }
+  const latest = latestRunFor(account.id);
+  return resultBadge(latest ? latest.result : null);
+}
+
+/**
+ * 卡片视图的一行「键 / 值」。
+ * @param {string} label
+ * @param {string} value
+ * @param {string} [extraClass]
+ * @returns {HTMLElement}
+ */
+function cardLine(label, value, extraClass) {
+  const row = el('div', 'acc-line');
+  row.appendChild(el('span', 'k', label));
+  row.appendChild(el('span', extraClass ? `v ${extraClass}` : 'v', value));
+  return row;
+}
+
+/**
+ * 卡片视图的一行「键 / 自定义控件」。
+ * @param {string} label
+ * @param {HTMLElement} control
+ * @returns {HTMLElement}
+ */
+function cardLineControl(label, control) {
+  const row = el('div', 'acc-line');
+  row.appendChild(el('span', 'k', label));
+  row.appendChild(control);
+  return row;
+}
+
+/**
+ * 卡片「签到时间」下拉（北京时间整点，每账号独立）。
+ *
+ * 不用打开编辑弹窗才能改：签到时间是高频调整项，且用户需要一眼看出「我的账号是不是都堆在同一小时」。
+ * 改动即时 PUT /api/accounts/:id，无需重新部署；title 里同时给出对应的 UTC 时刻，避免用户自己换算。
+ * 卡片视图与列表视图共用 `.acc-hour-select` 类名 —— 焦点守卫靠它一次覆盖两个视图。
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function checkinHourPicker(account) {
+  const hour = Number.isInteger(account.checkinHour) ? account.checkinHour : 8;
+  const select = el('select', 'acc-hour-select');
+  select.setAttribute('aria-label', `账号 ${account.name} 的签到时间（北京时间）`);
+  for (let h = 0; h < 24; h += 1) {
+    const option = document.createElement('option');
+    option.value = String(h);
+    option.textContent = `每天 ${String(h).padStart(2, '0')}:00`;
+    select.appendChild(option);
+  }
+  select.value = String(hour);
+  select.disabled = state.busy.hour === account.id;
+  select.title = `北京时间 ${fmtHour(hour)}（UTC ${fmtHour(hour - 8)}）`;
+  select.addEventListener('change', () => {
+    const next = Number(select.value);
+    if (!Number.isInteger(next) || next === hour) {
+      select.value = String(hour);
+      return;
+    }
+    void saveAccountHour(account, next);
+  });
+  return select;
+}
+
+/**
+ * 保存单个账号的签到时间。
+ * @param {object} account
+ * @param {number} hour 北京时间 0~23
+ */
+async function saveAccountHour(account, hour) {
+  // 不做请求前的全量重渲染：那会让下拉在请求期间闪回旧值。
+  state.busy.hour = account.id;
+  let failed = false;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'PUT', body: { checkinHour: hour } });
+    toast(`「${account.name}」改为每天 ${fmtHour(hour)}（北京时间）签到`, 'ok');
+  } catch (err) {
+    failed = true;
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      setError(err.code || 'INTERNAL', err.message || '保存签到时间失败');
+      toast('保存失败', 'bad');
+    }
+  } finally {
+    state.busy.hour = null;
+    // 失败必须强制重绘：此时下拉多半还持有焦点，焦点守卫会拦下普通重绘，
+    // 结果就是「服务端没改、界面还显示改后的值」+ 已删账号残留。成功路径不需要强制，
+    // 保留焦点更顺手（值本来就等于服务端值）。
+    await refreshAccounts({ force: failed });
+  }
+}
+
+// ============ 主题 ============
+
+/**
+ * 应用主题（不写 DOM 之外的副作用；persist=false 时不落 localStorage）。
+ * @param {'dark'|'light'} theme
+ * @param {boolean} [persist]
+ */
+function applyTheme(theme, persist = true) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  state.theme = next;
+  document.documentElement.setAttribute('data-theme', next);
+
+  const use = $('#theme-icon use');
+  if (use) use.setAttribute('href', next === 'dark' ? '#i-sun' : '#i-moon');
+
+  const btn = $('#btn-theme');
+  if (btn) {
+    btn.title = next === 'dark' ? '切换到日间模式' : '切换到夜间模式';
+    btn.setAttribute('aria-pressed', next === 'light' ? 'true' : 'false');
+  }
+
+  if (persist) store.set('wb:theme', next);
+}
+
+function toggleTheme() {
+  applyTheme(state.theme === 'dark' ? 'light' : 'dark');
+}
+
+/**
+ * 初始化主题：优先级 ?theme= > localStorage > 系统偏好。
+ * `<head>` 内联脚本已在首帧前做过一次，这里是幂等同步（顺带同步按钮态）。
+ */
+function initTheme() {
+  const query = new URLSearchParams(window.location.search).get('theme');
+  if (query === 'light' || query === 'dark') {
+    applyTheme(query, false);
+    return;
+  }
+  const saved = store.get('wb:theme');
+  if (saved === 'light' || saved === 'dark') {
+    applyTheme(saved, false);
+    return;
+  }
+  const prefersDark = typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  applyTheme(prefersDark ? 'dark' : 'light', false);
+}
+
+// ============ 视图与提示 ============
+
+/**
+ * 切换视图（setup / login / panel）。
+ * @param {'setup'|'login'|'panel'|'boot'} name
+ */
+function showView(name) {
+  state.view = name;
+  const views = { setup: '#view-setup', login: '#view-login', panel: '#view-panel' };
+  for (const [key, selector] of Object.entries(views)) {
+    const node = $(selector);
+    if (node) node.hidden = key !== name;
+  }
+  const loginInput = $('#login-password');
+  const setupInput = $('#setup-password');
+  if (name === 'login' && loginInput) loginInput.focus();
+  if (name === 'setup' && setupInput) setupInput.focus();
+  renderPageChrome();
+}
+
+/** @param {string} code @param {string} message */
+function setError(code, message) {
+  state.error = { code, message };
+  renderError();
+}
+
+function clearError() {
+  state.error = null;
+  renderError();
+}
+
+/** @param {string} code @param {string} message */
+function setAuthError(code, message) {
+  state.authError = { code, message };
+  renderAuthError();
+}
+
+function clearAuthError() {
+  state.authError = null;
+  renderAuthError();
+}
+
+/**
+ * 显示 toast（同一文案去重，最多同时 3 条，始终固定在右下角）。
+ * @param {string} message
+ * @param {'ok'|'bad'|'warn'|'info'} [kind]
+ */
+function toast(message, kind = 'info') {
+  const host = $('#toast-host');
+  if (!host) return;
+  const text = String(message);
+  // 去重：相同文案不叠加（连点按钮不会堆出一列胶囊）
+  for (const existing of Array.from(host.children)) {
+    if (existing.dataset.message === text) {
+      existing.remove();
+    }
+  }
+  while (host.children.length >= 3) {
+    host.firstElementChild.remove();
+  }
+  const node = el('div', `toast is-${kind}`, text);
+  node.dataset.message = text;
+  host.appendChild(node);
+  window.setTimeout(() => node.remove(), 4200);
+}
+
+// ============ 渲染 ============
+
+function renderAll() {
+  renderError();
+  renderAuthError();
+  renderAccounts();
+  renderLogs();
+  renderSettings();
+  syncBusy();
+}
+
+function renderError() {
+  const bar = $('#panel-error');
+  const text = $('#panel-error-text');
+  if (!bar || !text) return;
+  if (!state.error) {
+    bar.hidden = true;
+    text.textContent = '';
+    return;
+  }
+  text.textContent = `${state.error.code}: ${state.error.message}`;
+  bar.hidden = false;
+}
+
+function renderAuthError() {
+  const setupError = $('#setup-error');
+  const loginError = $('#login-error');
+  if (setupError) {
+    if (state.view === 'setup') {
+      setupError.hidden = !state.authError;
+      setupError.textContent = state.authError ? state.authError.message : '';
+    } else {
+      setupError.hidden = true;
+    }
+  }
+  if (loginError) {
+    if (state.view === 'login') {
+      loginError.hidden = !state.authError;
+      loginError.textContent = state.authError ? state.authError.message : '';
+    } else {
+      loginError.hidden = true;
+    }
+  }
+}
+
+/** @param {string} accountId @returns {string} */
+function accountName(accountId) {
+  const hit = state.accounts.find((account) => account.id === accountId);
+  return hit ? hit.name : '';
+}
+
+/**
+ * 找某账号最近一次结果（依赖 RunSummary.accountResults，零额外读）。
+ * @param {string} accountId
+ * @returns {string|null}
+ */
+function latestResultFor(accountId) {
+  const hit = latestRunFor(accountId);
+  return hit ? hit.result : null;
+}
+
+/**
+ * 最近一次命中该账号的 run（列表视图要显示「今天 09:00」，光有 result 不够）。
+ * @param {string} accountId
+ * @returns {{result:string, startedAt:string}|null}
+ */
+function latestRunFor(accountId) {
+  for (const run of state.logs) {
+    const results = Array.isArray(run.accountResults) ? run.accountResults : [];
+    const hit = results.find((item) => item && item.accountId === accountId);
+    if (hit) return { result: hit.result || 'failed', startedAt: run.startedAt || '' };
+  }
+  return null;
+}
+
+/**
+ * 今天（Asia/Shanghai）最近一次 run。
+ * @returns {object|null}
+ */
+function latestRunToday() {
+  const today = fmtDateStamp();
+  for (const run of state.logs) {
+    if (!run || !run.startedAt) continue;
+    const date = new Date(run.startedAt);
+    if (Number.isNaN(date.getTime())) continue;
+    if (fmtDateStamp(date) === today) return run;
+  }
+  return null;
+}
+
+/**
+ * 启用账号里最早的签到小时（用于「下次自动签到」）。
+ * @returns {number|null}
+ */
+function nextCheckinHour() {
+  const hours = state.accounts
+    .filter((account) => account && account.enabled === true)
+    .map((account) => (Number.isInteger(account.checkinHour) ? account.checkinHour : 8));
+  if (hours.length === 0) return null;
+  return Math.min(...hours);
+}
+
+/**
+ * 轮询焦点保护：活动元素是输入类控件且位于 .content 内 -> 本次重绘让路。
+ * 弹窗在 .content 之外，因此弹窗内输入不会被误判。
+ * @returns {boolean}
+ */
+function isEditingInPanel() {
+  const active = document.activeElement;
+  if (!active) return false;
+  const tag = active.tagName;
+  if (tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') return false;
+  return typeof active.closest === 'function' && active.closest('.content') !== null;
+}
+
+/**
+ * 当前要渲染的账号（返回副本，避免渲染层就地改动 state）。
+ * 顶栏搜索已移除，这里不再做关键词过滤；如需恢复，请把过滤放进本函数。
+ * @returns {object[]}
+ */
+function visibleAccounts() {
+  return state.accounts.slice();
+}
+
+/**
+ * KPI 四个卡片：全部由现有 state 推导，缺数据一律 「—」，绝不造环比。
+ */
+function renderKpis() {
+  const accounts = state.accounts;
+  const enabled = accounts.filter((account) => account && account.enabled === true);
+  const disabledCount = accounts.length - enabled.length;
+
+  // 1. 启用账号
+  const enabledNode = $('#kpi-enabled');
+  if (enabledNode) {
+    enabledNode.textContent = String(enabled.length);
+    enabledNode.appendChild(el('small', null, `/ ${accounts.length}`));
+  }
+  const enabledSub = $('#kpi-enabled-sub');
+  if (enabledSub) {
+    enabledSub.textContent = accounts.length === 0
+      ? '还没有账号'
+      : (disabledCount > 0 ? `${disabledCount} 个已禁用` : '全部启用');
+  }
+
+  // 2. 今日签到（取今天最近一次 run 的 success/total）
+  const todayRun = latestRunToday();
+  const todayNode = $('#kpi-today');
+  const todaySub = $('#kpi-today-sub');
+  if (todayRun) {
+    const success = Number(todayRun.success) || 0;
+    const total = Number(todayRun.total) || 0;
+    const failed = Number(todayRun.failed) || 0;
+    if (todayNode) {
+      todayNode.textContent = String(success);
+      todayNode.appendChild(el('small', null, `/ ${total}`));
+    }
+    if (todaySub) {
+      if (failed > 0) todaySub.textContent = `${failed} 个失败`;
+      else if (total > success) todaySub.textContent = `${total - success} 个未成功`;
+      else todaySub.textContent = '全部成功';
+    }
+  } else {
+    if (todayNode) todayNode.textContent = '—';
+    if (todaySub) todaySub.textContent = '今天还没有执行记录';
+  }
+
+  // 3. 总剩余积分（state.credits 汇总，只算已查到的）
+  let creditSum = 0;
+  let creditReady = 0;
+  for (const account of accounts) {
+    const entry = state.credits[account.id];
+    const raw = entry && entry.data ? entry.data.totalLeft : null;
+    if (raw === null || raw === undefined || raw === '') continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) {
+      creditSum += value;
+      creditReady += 1;
+    }
+  }
+  const creditNode = $('#kpi-credits');
+  const creditSub = $('#kpi-credits-sub');
+  if (creditNode) creditNode.textContent = creditReady > 0 ? fmtCredits(creditSum) : '—';
+  if (creditSub) {
+    creditSub.textContent = accounts.length === 0
+      ? '还没有账号'
+      : (creditReady === 0 ? '尚未查询额度' : `${creditReady} / ${accounts.length} 个已查询`);
+  }
+
+  // 4. 下次自动签到（启用账号里最早的 checkinHour）
+  const hour = nextCheckinHour();
+  const nextNode = $('#kpi-next');
+  const nextSub = $('#kpi-next-sub');
+  if (nextNode) {
+    nextNode.textContent = hour === null ? '—' : fmtHour(hour);
+    if (hour !== null) nextNode.appendChild(el('small', null, '明天'));
+  }
+  if (nextSub) nextSub.textContent = hour === null ? '没有启用账号' : '北京时间 · Cron 每小时扫描';
+
+  // 页头副标题：能算的拼进去，算不出的整段省略
+  const sub = $('#accounts-sub');
+  if (sub) {
+    const parts = [`${accounts.length} 个账号`];
+    if (todayRun) parts.push(`今日 ${Number(todayRun.success) || 0} / ${Number(todayRun.total) || 0} 已签到`);
+    if (creditReady > 0) parts.push(`共 ${fmtCredits(creditSum)} 积分`);
+    if (hour !== null) parts.push(`下次自动 ${fmtHour(hour)}`);
+    sub.textContent = parts.join(' · ');
+  }
+}
+
+/** 侧栏：角标 + 下次自动 + 版本。 */
+function renderNav() {
+  const accountsCount = $('#nav-count-accounts');
+  if (accountsCount) accountsCount.textContent = String(state.accounts.length);
+  const logsCount = $('#nav-count-logs');
+  if (logsCount) logsCount.textContent = String(state.logs.length);
+
+  const next = $('#side-next');
+  if (next) {
+    const hour = nextCheckinHour();
+    next.textContent = hour === null ? '—' : fmtHour(hour);
+  }
+
+  const version = $('#side-version');
+  if (version) {
+    const raw = state.bootstrap && state.bootstrap.version ? String(state.bootstrap.version) : '';
+    version.textContent = raw || '—';
+  }
+}
+
+/** 面包屑 / 文档标题 / 侧栏角标（数据变化与切页后都调）。 */
+function renderPageChrome() {
+  const label = PAGES[state.page] || PAGES.accounts;
+  const crumb = $('#crumb-current');
+  if (crumb) crumb.textContent = label;
+  document.title = state.view === 'panel' ? `${label} · WorkBuddy Daily` : DEFAULT_TITLE;
+  renderNav();
+}
+
+/**
+ * 切换面板栏目。
+ * ⚠ 只在 state.view === 'panel' 时才动 URL 与标题（否则登录页会被写成「设置 · …」）。
+ * @param {'accounts'|'logs'|'settings'} name
+ */
+function setPage(name) {
+  const page = PAGES[name] ? name : 'accounts';
+  state.page = page;
+
+  for (const node of $$('.page[data-page]')) {
+    node.hidden = node.dataset.page !== page;
+  }
+  for (const link of $$('[data-page-link]')) {
+    const on = link.dataset.pageLink === page;
+    link.classList.toggle('is-active', on);
+    if (on) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  }
+
+  store.set('wb:page', page);
+  renderPageChrome();
+
+  if (state.view === 'panel') {
+    // R13：replaceState 必须保留 query string，否则 ?theme= 会在切页后丢失
+    const target = `${window.location.pathname}${window.location.search}#${page}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (current !== target) window.history.replaceState(null, '', target);
+  }
+
+  window.scrollTo(0, 0);
+}
+
+/**
+ * 切换账号展示方式（卡片 / 列表），并记忆。
+ * @param {'cards'|'list'} view
+ */
+function setAccView(view) {
+  const next = view === 'cards' ? 'cards' : 'list';
+  state.accView = next;
+  for (const node of $$('.acc-view[data-view]')) {
+    node.hidden = node.dataset.view !== next;
+  }
+  for (const btn of $$('[data-view-btn]')) {
+    btn.setAttribute('aria-pressed', btn.dataset.viewBtn === next ? 'true' : 'false');
+  }
+  store.set('wb:acc-view', next);
+}
+
+/**
+ * 列表行展开/收起（手风琴：一次只开一个）。
+ * 直接改 hidden / class，不重建 DOM —— 重建会把焦点和选择一起丢掉。
+ * @param {string} accountId
+ */
+function toggleRowDetail(accountId) {
+  const id = String(accountId || '');
+  if (!id) return;
+  const willOpen = state.expanded[id] !== true;
+  state.expanded = {};
+  if (willOpen) state.expanded[id] = true;
+
+  for (const node of $$('.detail[data-detail]')) {
+    node.hidden = state.expanded[node.dataset.detail] !== true;
+  }
+  for (const row of $$('.t-row[data-row]')) {
+    const on = state.expanded[row.dataset.row] === true;
+    row.classList.toggle('is-open', on);
+    const chev = row.querySelector('.row-chev');
+    if (chev) chev.setAttribute('aria-expanded', on ? 'true' : 'false');
+  }
+}
+
+/**
+ * 渲染账号区（卡片 + 列表 + 计数 + KPI）。
+ * @param {boolean} [force] true 时无视焦点守卫强制重绘（服务端状态可能与界面不一致时用）
+ */
+function renderAccounts(force = false) {
+  // 全量重建 DOM。若用户正在操作面板里的输入类控件（30s 轮询会触发重建），
+  // 重建会把下拉关掉、输入清空，所以这次刷新直接让路，等下一轮。
+  // 例外：saveAccountHour 失败等「界面已经错了」的场景必须 force 重绘。
+  if (force !== true && isEditingInPanel()) {
+    renderKpis();
+    return;
+  }
+
+  const cards = $('#accounts-cards');
+  const body = $('#acc-body');
+  const skeleton = $('#accounts-skeleton');
+  const empty = $('#accounts-empty');
+  if (!cards || !body) return;
+
+  cards.textContent = '';
+  body.textContent = '';
+
+  const loading = state.loading.accounts && state.accounts.length === 0;
+  if (skeleton) skeleton.hidden = !loading;
+
+  const rows = visibleAccounts();
+  const noAccount = state.accounts.length === 0;
+  const noMatch = !noAccount && rows.length === 0;
+
+  if (empty) {
+    empty.hidden = loading || (!noAccount && !noMatch);
+    if (noAccount) empty.textContent = '还没有账号。点击「新增账号」，粘贴 WorkBuddy token 即可开始。';
+    else if (noMatch) empty.textContent = '没有匹配的账号。清空顶栏搜索即可看到全部。';
+  }
+
+  for (const account of rows) {
+    cards.appendChild(accountCard(account));
+    body.appendChild(accountRow(account));
+    body.appendChild(accountDetail(account));
+  }
+
+  const count = $('#accounts-count');
+  if (count) count.textContent = `${state.accounts.length} 个`;
+
+  renderKpis();
+  // 增删改 / 导入后，侧栏「账号概览」角标必须立刻跟着变，不能等下一轮 30s 轮询
+  renderNav();
+}
+
+/**
  * 账号卡片：基础信息 + 积分配额 + 操作。
+ *
+ * ⚠ 不可改清单（test/frontend-filename.test.mjs 用正则从本函数抽取断言）：
+ *   1. 必须存在 `el('div', 'acc-card-head')` 与 `el('div', 'acc-card-foot')`；
+ *   2. 必须存在 `const exportBtn = el('button', `btn btn-ghost btn-sm${exporting ? ' is-busy' : ''}`, '导出')`
+ *      与 `const exporting = isExporting(account.id);`、`exportBtn.disabled = exporting;`、
+ *      `exportBtn.setAttribute('aria-busy', …)`、`foot.appendChild(exportBtn)`、
+ *      `exportBtn.addEventListener('click', () => askExportAccount(account))`；
+ *   3. 导出按钮不得出现在 head 里；
+ *   4. 本函数体内不得出现**列 0 的 `}`**（测试用 `[\s\S]*?\n\}` 截取函数体，
+ *      出现就会提前截断）。同理不要把卡片拆成 accountCardHead() 之类子函数。
  * @param {object} account
  * @returns {HTMLElement}
  */
@@ -512,19 +983,30 @@ function accountCard(account) {
   const card = el('article', 'acc-card');
   const entry = state.credits[account.id];
   const planLabel = entry && entry.data ? entry.data.planLabel : null;
-
-  // ---- 卡片头：状态点 + 名称 + 套餐徽标 + 编辑/删除 ----
-  const head = el('div', 'acc-card-head');
-  const dot = el('span', `dot${account.enabled ? ' on' : ''}`);
-  dot.title = account.enabled ? '已启用' : '已禁用';
-  head.appendChild(dot);
-  head.appendChild(el('strong', 'acc-card-name', account.name));
-  if (planLabel) head.appendChild(el('span', 'plan-badge', planLabel));
-
-  const tools = el('div', 'acc-card-tools');
   const testing = state.busy.test === account.id;
 
-  const editBtn = el('button', 'btn btn-ghost btn-icon');
+  // ---- 卡片头：头像 + 名称/套餐 + 打码 token + 状态徽标 + 编辑/删除 ----
+  const head = el('div', 'acc-card-head');
+  const avatar = el('span', 'avatar', String(account.name || '?').slice(0, 1));
+  avatar.setAttribute('aria-hidden', 'true');
+  head.appendChild(avatar);
+
+  const ident = el('div', 'acc-card-id');
+  const nameRow = el('div', 'nm');
+  nameRow.appendChild(document.createTextNode(account.name || account.id || '未命名'));
+  if (planLabel) {
+    const isPro = String(planLabel).toLowerCase() === 'pro';
+    nameRow.appendChild(el('span', isPro ? 'plan pro' : 'plan', planLabel));
+  }
+  ident.appendChild(nameRow);
+  ident.appendChild(el('div', 'tk', account.tokenMasked || '—'));
+  head.appendChild(ident);
+
+  const spacer = el('div', 'spacer');
+  spacer.appendChild(statusBadge(account));
+  head.appendChild(spacer);
+
+  const editBtn = el('button', 'btn btn-ghost btn-icon btn-sm');
   editBtn.type = 'button';
   editBtn.title = '编辑';
   editBtn.setAttribute('aria-label', `编辑账号 ${account.name}`);
@@ -532,7 +1014,7 @@ function accountCard(account) {
   editBtn.disabled = testing;
   editBtn.addEventListener('click', () => openAccountDialog(account));
 
-  const delBtn = el('button', 'btn btn-ghost btn-icon btn-danger-ghost');
+  const delBtn = el('button', 'btn btn-ghost btn-icon btn-sm btn-danger-ghost');
   delBtn.type = 'button';
   delBtn.title = '删除';
   delBtn.setAttribute('aria-label', `删除账号 ${account.name}`);
@@ -540,23 +1022,20 @@ function accountCard(account) {
   delBtn.disabled = testing;
   delBtn.addEventListener('click', () => askDeleteAccount(account));
 
-  tools.appendChild(editBtn);
-  tools.appendChild(delBtn);
-  head.appendChild(tools);
+  head.appendChild(editBtn);
+  head.appendChild(delBtn);
   card.appendChild(head);
 
-  // ---- 凭据与最近签到结果 ----
-  const meta = el('div', 'acc-meta');
-  meta.appendChild(el('code', 'acc-token', account.tokenMasked));
-  meta.appendChild(el('span', `acc-uid${account.uid ? '' : ' is-empty'}`, account.uid ? `UID ${account.uid}` : 'UID —'));
-  meta.appendChild(resultBadge(latestResultFor(account.id)));
-  card.appendChild(meta);
-  card.appendChild(tokenStateRow(account));
+  // ---- 主体：UID / Token 生命周期 / 签到时间 / 积分配额 ----
+  const body = el('div', 'acc-card-b');
+  body.appendChild(cardLine('UID', account.uid || '—', 'mono'));
+  const token = tokenState(account);
+  body.appendChild(cardLine('Token', token.text, token.tone === 'bad' ? 'bad' : ''));
+  body.appendChild(cardLineControl('签到时间', checkinHourPicker(account)));
+  body.appendChild(creditBlock(account, entry));
+  card.appendChild(body);
 
-  // ---- 积分配额 ----
-  card.appendChild(creditBlock(account, entry));
-
-  // ---- 操作 ----
+  // ---- 底部操作区：测试签到 / 刷新额度 / 导出（编辑与删除在头部图标位） ----
   const foot = el('div', 'acc-card-foot');
   // busy 态：文案不变 + 按钮内 spinner + disabled（不做绝对定位浮层，不替换文案）
   const testBtn = el('button', `btn btn-ghost btn-sm${testing ? ' is-busy' : ''}`, '测试签到');
@@ -595,7 +1074,145 @@ function accountCard(account) {
 }
 
 /**
- * 积分配额区块（含加载 / 错误 / 空态）。
+ * 列表视图的一行。
+ * ⚠ 直接子元素必须恰好 6 个且顺序固定（≤1100px 靠 nth-child 映射 grid-area）：
+ *   1 .acc-cell  2 状态  3 签到时间  4 .money  5 .dim  6 .row-actions
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function accountRow(account) {
+  const row = el('div', 't-row is-clickable');
+  row.dataset.row = account.id;
+  if (state.expanded[account.id] === true) row.classList.add('is-open');
+
+  const entry = state.credits[account.id];
+  const planLabel = entry && entry.data ? entry.data.planLabel : null;
+
+  // 1. 账号（avatar + 名称/套餐 + 打码 token）
+  const cell = el('div', 'acc-cell');
+  const avatar = el('span', 'avatar', String(account.name || '?').slice(0, 1));
+  avatar.setAttribute('aria-hidden', 'true');
+  cell.appendChild(avatar);
+  const ident = el('div', 'acc-cell-id');
+  const nameRow = el('div', 'nm');
+  nameRow.appendChild(document.createTextNode(account.name || account.id || '未命名'));
+  if (planLabel) {
+    const isPro = String(planLabel).toLowerCase() === 'pro';
+    nameRow.appendChild(el('span', isPro ? 'plan pro' : 'plan', planLabel));
+  }
+  ident.appendChild(nameRow);
+  ident.appendChild(el('div', 'tk', account.tokenMasked || '—'));
+  cell.appendChild(ident);
+  row.appendChild(cell);
+
+  // 2. 状态
+  const status = el('span');
+  status.appendChild(statusBadge(account));
+  row.appendChild(status);
+
+  // 3. 签到时间
+  const hourCell = el('span');
+  hourCell.appendChild(checkinHourPicker(account));
+  row.appendChild(hourCell);
+
+  // 4. 剩余积分
+  const moneyValue = entry && entry.data ? entry.data.totalLeft : null;
+  const money = el('span', 'money', fmtCredits(moneyValue));
+  if (moneyValue !== null && moneyValue !== undefined && Number.isFinite(Number(moneyValue))) {
+    money.appendChild(el('small', null, '分'));
+  }
+  row.appendChild(money);
+
+  // 5. 最近签到
+  const latest = latestRunFor(account.id);
+  row.appendChild(el('span', 'dim', latest && latest.startedAt ? fmtDayTime(latest.startedAt) : '—'));
+
+  // 6. 操作
+  const actions = el('div', 'row-actions');
+
+  const editBtn = el('button', 'btn btn-ghost btn-icon btn-sm');
+  editBtn.type = 'button';
+  editBtn.title = '编辑';
+  editBtn.setAttribute('aria-label', `编辑账号 ${account.name}`);
+  editBtn.appendChild(icon('edit'));
+  editBtn.addEventListener('click', () => openAccountDialog(account));
+
+  const delBtn = el('button', 'btn btn-ghost btn-icon btn-sm btn-danger-ghost');
+  delBtn.type = 'button';
+  delBtn.title = '删除';
+  delBtn.setAttribute('aria-label', `删除账号 ${account.name}`);
+  delBtn.appendChild(icon('trash'));
+  delBtn.addEventListener('click', () => askDeleteAccount(account));
+
+  const chevBtn = el('button', 'row-chev');
+  chevBtn.type = 'button';
+  chevBtn.setAttribute('aria-expanded', state.expanded[account.id] === true ? 'true' : 'false');
+  chevBtn.setAttribute('aria-label', `展开账号 ${account.name} 的积分明细`);
+  chevBtn.title = '展开积分明细';
+  chevBtn.appendChild(icon('chev'));
+  chevBtn.addEventListener('click', () => toggleRowDetail(account.id));
+
+  actions.appendChild(editBtn);
+  actions.appendChild(delBtn);
+  actions.appendChild(chevBtn);
+  row.appendChild(actions);
+
+  // 点行展开；点按钮 / 下拉不触发展开
+  row.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest('button') || target.closest('select') || target.closest('option')) return;
+    toggleRowDetail(account.id);
+  });
+
+  return row;
+}
+
+/**
+ * 列表视图的展开明细（行的兄弟节点，紧跟其后）。
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function accountDetail(account) {
+  const open = state.expanded[account.id] === true;
+  const wrap = el('div', 'detail');
+  wrap.dataset.detail = account.id;
+  wrap.hidden = !open;
+
+  const entry = state.credits[account.id];
+  wrap.appendChild(creditBlock(account, entry));
+
+  const foot = el('div', 'detail-foot');
+  const data = entry && entry.data ? entry.data : null;
+  if (data && data.switchAt) foot.appendChild(el('span', null, `积分切换时间 ${fmtDateTime(data.switchAt)}`));
+  const token = tokenState(account);
+  foot.appendChild(el('span', null, `Token ${token.text}`));
+
+  const grow = el('div', 'grow');
+  grow.appendChild(detailAction('刷新额度', () => loadCredits(account.id)));
+  grow.appendChild(detailAction('测试签到', () => testCheckin(account)));
+  grow.appendChild(detailAction('导出', () => askExportAccount(account)));
+  foot.appendChild(grow);
+
+  wrap.appendChild(foot);
+  return wrap;
+}
+
+/**
+ * 明细面板里的小按钮。
+ * @param {string} label
+ * @param {Function} onClick
+ * @returns {HTMLElement}
+ */
+function detailAction(label, onClick) {
+  const btn = el('button', 'btn btn-ghost btn-sm', label);
+  btn.type = 'button';
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+/**
+ * 积分配额区块（含加载 / 错误 / 空态）。卡片与列表明细共用。
  * @param {object} account
  * @param {object|undefined} entry
  * @returns {HTMLElement}
@@ -666,11 +1283,26 @@ function creditBlock(account, entry) {
 
 /**
  * 单类积分：名称 + 剩余 + 已使用/总量 + 剩余百分比 + 进度条。
+ *
+ * 条长表示**剩余额度**（越长越充足），与右侧「剩余 X%」同源。
+ * ⚠ 不要改回 `used / total`：填充色是 --primary（青绿），用青绿表示「已用」会出现
+ * 「绿条满格 = 额度用光」的反直觉表达。旁边「已使用 1,580 / 5,000」只是数字说明，不冲突。
  * @param {object} group
  * @returns {HTMLElement}
  */
 function creditGroupRow(group) {
   const row = el('div', 'credit-group');
+
+  const total = Number(group.total);
+  const used = Number(group.used);
+  const reported = Number(group.remainPercent);
+  // 优先用后端算好的 remainPercent；缺失时用 (total - used) / total 兜底。
+  // 条宽与文案都只认这一个 percent，保证两者永远一致。
+  const percent = Number.isFinite(reported)
+    ? Math.max(0, Math.min(100, Math.round(reported)))
+    : (Number.isFinite(total) && total > 0 && Number.isFinite(used)
+      ? Math.max(0, Math.min(100, Math.round(((total - used) / total) * 100)))
+      : 0);
 
   const head = el('div', 'credit-group-head');
   head.appendChild(el('span', 'credit-group-label', group.label || '积分'));
@@ -679,12 +1311,9 @@ function creditGroupRow(group) {
 
   const sub = el('div', 'credit-group-sub');
   sub.appendChild(el('span', null, `已使用 ${fmtCredits(group.used)}/${fmtCredits(group.total)}`));
-  sub.appendChild(el('span', null, `剩余${Number.isFinite(Number(group.remainPercent)) ? group.remainPercent : 0}%`));
+  sub.appendChild(el('span', null, `剩余${percent}%`));
   row.appendChild(sub);
 
-  const total = Number(group.total);
-  const used = Number(group.used);
-  const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((used / total) * 100))) : 0;
   const track = el('div', 'credit-track');
   const bar = el('i');
   bar.style.width = `${percent}%`;
@@ -719,23 +1348,57 @@ function visibleLogs() {
   });
 }
 
+/**
+ * 日志页副标题与条数：成功率等统计全部从 state.logs 聚合，样本为 0 时整句省略。
+ * @param {object[]} rows 当前筛选后的行
+ */
+function renderLogsStats(rows) {
+  const count = $('#logs-count');
+  if (count) count.textContent = `${rows.length} 条`;
+
+  const sub = $('#logs-sub');
+  if (!sub) return;
+  const total = state.logs.length;
+  if (total === 0) {
+    sub.textContent = '还没有执行记录';
+    return;
+  }
+  let sumSuccess = 0;
+  let sumTotal = 0;
+  for (const run of state.logs) {
+    sumSuccess += Number(run.success) || 0;
+    sumTotal += Number(run.total) || 0;
+  }
+  const parts = [`最近 ${total} 次执行`];
+  if (sumTotal > 0) parts.push(`成功率 ${Math.round((sumSuccess / sumTotal) * 100)}%`);
+  const newest = state.logs[0];
+  const writes = newest ? Number(newest.kvWriteCount) : NaN;
+  if (Number.isFinite(writes)) parts.push(`最近一次写入 ${writes} 次 KV`);
+  sub.textContent = parts.join(' · ');
+}
+
 function renderLogs() {
   const list = $('#logs-list');
   const skeleton = $('#logs-skeleton');
   const empty = $('#logs-empty');
+  if (!list || !skeleton || !empty) return;
+
   list.textContent = '';
 
   const loading = state.loading.logs && state.logs.length === 0;
   skeleton.hidden = !loading;
 
   const rows = visibleLogs();
+  renderLogsStats(rows);
+  renderNav();
+
   if (loading) {
     empty.hidden = true;
     return;
   }
   if (state.logs.length === 0) {
     empty.hidden = false;
-    empty.textContent = '还没有执行记录。Cron 每天 09:00（Asia/Shanghai）自动执行，也可以点「立即全部签到」。';
+    empty.textContent = '还没有执行记录。后台每 15 分钟扫描一次，到账号设定的签到时间才会真正执行；也可以点「立即全部签到」。';
     return;
   }
   if (rows.length === 0) {
@@ -750,6 +1413,7 @@ function renderLogs() {
 }
 
 /**
+ * 日志行（头部是 <button>，可键盘操作；不用相邻兄弟选择器，避免轮询重绘时错位）。
  * @param {object} run RunSummary
  * @returns {HTMLElement}
  */
@@ -761,28 +1425,31 @@ function runItem(run) {
   head.setAttribute('aria-expanded', state.opened[run.runId] ? 'true' : 'false');
 
   const time = el('div', 'log-time');
-  time.appendChild(el('strong', null, fmtTime(run.startedAt)));
+  time.appendChild(el('b', null, fmtTime(run.startedAt)));
   time.appendChild(el('small', null, fmtRelative(run.startedAt)));
 
-  const trigger = triggerBadge(run.trigger);
+  const trigger = el('span', 'trg');
+  trigger.appendChild(triggerBadge(run.trigger));
 
-  const meta = el('div', 'log-meta');
+  const meta = el('div', 'log-sum');
   const total = Number(run.total) || 0;
   const success = Number(run.success) || 0;
   const failed = Number(run.failed) || 0;
   const skipped = Number(run.skipped) || 0;
   const writes = Number(run.kvWriteCount) || 0;
   // 单行紧凑摘要：成功 2/3 · 失败 1 · 269ms · 写入 4（失败为 0 时不出现「失败 0」）
-  const summaryParts = [`成功 ${success}/${total}`];
-  if (failed > 0) summaryParts.push(`失败 ${failed}`);
-  if (skipped > 0) summaryParts.push(`跳过 ${skipped}`);
-  summaryParts.push(fmtDuration(run.durationMs));
-  summaryParts.push(`写入 ${writes}`);
-  if (run.truncated) summaryParts.push('已截断');
-  meta.textContent = summaryParts.join(' · ');
-  if (failed > 0) meta.classList.add('is-bad');
+  // 只有「失败 N」这一段染红，其余保持次级正文色。
+  meta.appendChild(document.createTextNode(`成功 ${success}/${total}`));
+  if (failed > 0) {
+    meta.appendChild(document.createTextNode(' · '));
+    meta.appendChild(el('span', 'bad', `失败 ${failed}`));
+  }
+  if (skipped > 0) meta.appendChild(document.createTextNode(` · 跳过 ${skipped}`));
+  meta.appendChild(document.createTextNode(` · ${fmtDuration(run.durationMs)} · 写入 ${writes}`));
+  if (run.truncated) meta.appendChild(document.createTextNode(' · 已截断'));
 
-  const chevron = el('span', 'log-chevron', '▶');
+  const chevron = el('span', 'log-chevron');
+  chevron.appendChild(icon('chev'));
 
   head.appendChild(time);
   head.appendChild(trigger);
@@ -837,41 +1504,67 @@ function entryRow(entry) {
 
 function renderSettings() {
   const settings = state.settings;
-  if (settings) {
-    $('#retention-input').value = String(settings.retentionRuns);
+  const retention = $('#retention-input');
+  // 焦点保护：用户正在这个输入框里打字时，30s 轮询不得覆写 value（否则光标与输入一起丢）
+  if (settings && retention && document.activeElement !== retention) {
+    retention.value = String(settings.retentionRuns);
   }
 
   const prefixNode = $('#mcp-prefix');
-  if (state.mcpKey && state.mcpKey.exists) {
-    prefixNode.textContent = `当前 Key：${state.mcpKey.prefix || '（未知前缀）'}`;
-    setButtonContent($('#btn-gen-mcp'), null, '重置 Key');
-  } else {
-    prefixNode.textContent = '未生成';
-    setButtonContent($('#btn-gen-mcp'), null, '生成 Key');
+  const exists = Boolean(state.mcpKey && state.mcpKey.exists);
+  if (prefixNode) {
+    prefixNode.textContent = exists
+      ? `当前 Key：${state.mcpKey.prefix || '（未知前缀）'}`
+      : '未生成';
+    const box = prefixNode.closest('.keybox');
+    if (box) box.classList.toggle('is-off', !exists);
   }
+
+  const genBtn = $('#btn-gen-mcp');
+  if (genBtn) setButtonContent(genBtn, null, exists ? '重置 Key' : '生成 Key');
 }
 
-/** 同步所有按钮的 busy 状态（spinner 在按钮内，文案不变）。 */
+/** 同步所有按钮的 busy 状态（spinner 在按钮内，文案不变；每个节点都做空值保护）。 */
 function syncBusy() {
   const runBtn = $('#btn-run-all');
-  runBtn.disabled = state.busy.run;
-  runBtn.classList.toggle('is-busy', state.busy.run);
-  runBtn.setAttribute('aria-busy', state.busy.run ? 'true' : 'false');
-  setButtonContent(runBtn, 'play', '立即全部签到');
+  if (runBtn) {
+    runBtn.disabled = state.busy.run;
+    runBtn.classList.toggle('is-busy', state.busy.run);
+    runBtn.setAttribute('aria-busy', state.busy.run ? 'true' : 'false');
+    setButtonContent(runBtn, 'play', '立即全部签到');
+  }
 
-  $('#btn-refresh').disabled = state.busy.run;
-  $('#btn-add-account').disabled = state.busy.run;
-  $('#btn-save-retention').disabled = state.busy.retention;
-  $('#btn-gen-mcp').disabled = state.busy.key;
-  $('#btn-change-pw').disabled = state.busy.pw;
-  $('#btn-setup').disabled = state.busy.setup;
-  $('#btn-login').disabled = state.busy.login;
-  $('#btn-clear-logs').disabled = state.busy.run;
+  /**
+   * @param {string} selector
+   * @param {boolean} disabled
+   * @param {boolean} [busy] 传了才更新 is-busy / aria-busy
+   */
+  const setState = (selector, disabled, busy) => {
+    const node = $(selector);
+    if (!node) return;
+    node.disabled = disabled === true;
+    if (busy !== undefined) {
+      node.classList.toggle('is-busy', busy === true);
+      node.setAttribute('aria-busy', busy === true ? 'true' : 'false');
+    }
+  };
+
+  setState('#btn-refresh', state.busy.run);
+  setState('#btn-add-account', state.busy.run);
+  setState('#btn-import-accounts', state.busy.run || state.busy.import, state.busy.import);
+  setState('#btn-clear-logs', state.busy.run);
+  setState('#btn-save-retention', state.busy.retention);
+  setState('#btn-gen-mcp', state.busy.key);
+  setState('#btn-change-pw', state.busy.pw);
+  setState('#btn-setup', state.busy.setup);
+  setState('#btn-login', state.busy.login);
 
   // 「导出全部」忙碌态：单账号导出不影响这里，反之亦然
   const exportAllBtn = $('#btn-export-accounts');
   if (exportAllBtn) {
     exportAllBtn.disabled = state.busy.export.all;
+    // 整轮签到期间上游可能正在轮换 token，此时导出的会是半截状态，先与 run 互斥
+    if (state.busy.run) exportAllBtn.disabled = true;
     exportAllBtn.classList.toggle('is-busy', state.busy.export.all);
     exportAllBtn.setAttribute('aria-busy', state.busy.export.all ? 'true' : 'false');
   }
@@ -937,7 +1630,14 @@ async function boot() {
   try {
     const data = await api('/api/bootstrap', { allow401: true });
     state.setupTokenRequired = Boolean(data && data.setupTokenRequired);
-    $('#setup-token-wrap').hidden = !state.setupTokenRequired;
+    state.bootstrap = {
+      initialized: Boolean(data && data.initialized),
+      version: (data && data.version) || '',
+      setupTokenRequired: state.setupTokenRequired,
+    };
+    const tokenWrap = $('#setup-token-wrap');
+    if (tokenWrap) tokenWrap.hidden = !state.setupTokenRequired;
+    renderNav();
 
     if (!data || !data.initialized) {
       showView('setup');
@@ -959,7 +1659,8 @@ async function boot() {
   } catch (err) {
     // bootstrap 本身失败：留在登录页给一个重试入口
     showView('login');
-    $('#btn-retry').hidden = false;
+    const retry = $('#btn-retry');
+    if (retry) retry.hidden = false;
     setAuthError(err.code || 'NETWORK', err.message || '无法连接服务');
   }
 }
@@ -1040,12 +1741,23 @@ function stopPolling() {
   }
 }
 
-/** 只刷新账号（增删改后）。 */
-async function refreshAccounts() {
+/**
+ * 只刷新账号（增删改后）。
+ * @param {{force?:boolean}} [options] force=true 时无视焦点守卫强制重绘
+ */
+async function refreshAccounts(options = {}) {
   try {
     const data = await api('/api/accounts');
     state.accounts = Array.isArray(data) ? data : [];
-    renderAccounts();
+    // 账号可能被删：清掉指向已不存在账号的展开态
+    const ids = new Set(state.accounts.map((account) => account.id));
+    for (const id of Object.keys(state.expanded)) {
+      if (!ids.has(id)) delete state.expanded[id];
+    }
+    for (const id of Object.keys(state.credits)) {
+      if (!ids.has(id)) delete state.credits[id];
+    }
+    renderAccounts(options.force === true);
     void loadAllCredits({ onlyMissing: true, silent: true });
   } catch (err) {
     if (!(err instanceof ApiError) || err.status !== 401) setError(err.code || 'INTERNAL', err.message);
@@ -1214,6 +1926,7 @@ async function doLogout() {
   state.credits = {};
   state.details = {};
   state.opened = {};
+  state.expanded = {};
   clearError();
   clearAuthError();
   showView('login');
@@ -1314,6 +2027,7 @@ function openAccountDialog(account) {
  */
 function setFormError(selector, message) {
   const node = $(selector);
+  if (!node) return;
   if (!message) {
     node.hidden = true;
     node.textContent = '';
@@ -1393,6 +2107,7 @@ function askDeleteAccount(account) {
         await api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'DELETE' });
         toast('账号已删除', 'ok');
         delete state.credits[account.id];
+        delete state.expanded[account.id];
         await refreshAccounts();
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) setError(err.code || 'INTERNAL', err.message || '删除失败');
@@ -1430,6 +2145,9 @@ function compactImportPayload(payload) {
   return pick(payload);
 }
 
+/** 导入体积上限：与后端 route 的 bodyLimit（5MB）对齐，避免后端 413 被前端误报成「不是合法 JSON」。 */
+const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
+
 /**
  * 选择并导入 cockpit-tools 兼容的账号 JSON。
  * @param {Event} event
@@ -1439,8 +2157,8 @@ async function onImportFile(event) {
   const file = input && input.files && input.files[0];
   if (input) input.value = '';
   if (!file) return;
-  if (file.size > 8 * 1024 * 1024) {
-    toast('文件过大（上限 8MB）', 'bad');
+  if (file.size > IMPORT_MAX_BYTES) {
+    toast('文件过大（上限 5MB）', 'bad');
     return;
   }
   let payload;
@@ -1453,6 +2171,7 @@ async function onImportFile(event) {
 
   state.busy.import = true;
   renderAccounts();
+  syncBusy();
   try {
     const data = await api('/api/accounts/import', { method: 'POST', body: compactImportPayload(payload) });
     const parts = [];
@@ -1480,6 +2199,7 @@ async function onImportFile(event) {
   } finally {
     state.busy.import = false;
     renderAccounts();
+    syncBusy();
   }
 }
 
@@ -1620,7 +2340,7 @@ function askClearLogs() {
 async function saveRetention() {
   const raw = Number($('#retention-input').value);
   const hint = $('#retention-hint');
-  hint.hidden = true;
+  if (hint) hint.hidden = true;
   if (!Number.isInteger(raw) || raw < 5 || raw > 100) {
     setError('BAD_REQUEST', '日志保留条数需为 5~100 的整数');
     return;
@@ -1630,7 +2350,7 @@ async function saveRetention() {
   try {
     state.settings = await api('/api/settings', { method: 'PUT', body: { retentionRuns: raw } });
     renderSettings();
-    hint.hidden = false;
+    if (hint) hint.hidden = false;
     const evicted = Number(state.settings && state.settings.evicted) || 0;
     toast(evicted > 0 ? `设置已保存，同时清理了 ${evicted} 条旧记录` : '设置已保存', 'ok');
     if (evicted > 0) await refreshLogs();
@@ -1797,6 +2517,21 @@ function bindEvents() {
   $('#btn-change-pw').addEventListener('click', changePassword);
   $('#btn-copy-key').addEventListener('click', copyMcpKey);
   $('#btn-panel-error-close').addEventListener('click', clearError);
+  $('#btn-theme').addEventListener('click', toggleTheme);
+
+  // 栏目导航（侧栏 / 底部 Tab Bar 共用同一批 [data-page-link]）
+  for (const link of $$('[data-page-link]')) {
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      setPage(link.dataset.pageLink);
+    });
+  }
+  window.addEventListener('hashchange', () => setPage(window.location.hash.slice(1)));
+
+  // 账号双视图切换
+  for (const btn of $$('[data-view-btn]')) {
+    btn.addEventListener('click', () => setAccView(btn.dataset.viewBtn));
+  }
 
   $('#filter-all').addEventListener('click', () => setFilter(false));
   $('#filter-failed').addEventListener('click', () => setFilter(true));
@@ -1832,14 +2567,24 @@ function bindEvents() {
  */
 function setFilter(onlyFailed) {
   state.filters.onlyFailed = onlyFailed;
-  $('#filter-all').classList.toggle('is-active', !onlyFailed);
-  $('#filter-failed').classList.toggle('is-active', onlyFailed);
+  const all = $('#filter-all');
+  const failed = $('#filter-failed');
+  if (all) {
+    all.classList.toggle('is-on', !onlyFailed);
+    all.setAttribute('aria-pressed', onlyFailed ? 'false' : 'true');
+  }
+  if (failed) {
+    failed.classList.toggle('is-on', onlyFailed);
+    failed.setAttribute('aria-pressed', onlyFailed ? 'true' : 'false');
+  }
   renderLogs();
 }
 
-// ============ 启动 ============
+// ============ 启动（顺序不可变） ============
 
-hydrateStaticIcons();
+initTheme();
 bindEvents();
 renderAll();
+setPage(window.location.hash.slice(1) || store.get('wb:page') || 'accounts');
+setAccView(store.get('wb:acc-view') === 'cards' ? 'cards' : 'list');
 boot();
