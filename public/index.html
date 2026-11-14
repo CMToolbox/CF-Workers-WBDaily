@@ -184,9 +184,19 @@
           </div>
 
           <div class="setting">
+            <h3>签到时间（北京时间）</h3>
+            <p class="muted">每小时整点起算。Cron 每 15 分钟轮询一次，只有落在该小时的触发才真正签到，同一小时最多重试 4 轮。</p>
+            <div class="row-inline">
+              <select id="checkin-hour-select" class="input input-sm" aria-label="签到小时"></select>
+              <button id="btn-save-checkin-hour" class="btn btn-ghost" type="button">保存</button>
+            </div>
+            <p id="checkin-hour-hint" class="hint" hidden>已保存，下一次 Cron 触发即生效。</p>
+          </div>
+
+          <div class="setting">
             <h3>Cron</h3>
-            <p class="muted">每天 <strong id="cron-local">09:00</strong>（Asia/Shanghai）自动执行；对应 <code id="cron-utc">0 1 * * *</code> UTC。</p>
-            <p class="muted">要改时间：修改 <code>wrangler.toml</code> 里的 <code>[triggers] crons</code>，然后重新 <code>npm run deploy</code>。</p>
+            <p class="muted">每天 <strong id="cron-local">08:00</strong>（Asia/Shanghai）执行；对应 UTC <strong id="cron-utc">00:00</strong>。</p>
+            <p class="muted">部署表达式固定为 <code>*/15 * * * *</code>（每 15 分钟轮询），签到小时由上面的设置决定，改时间不需要重新部署。</p>
             <p class="muted">版本 <span id="settings-version">-</span></p>
           </div>
         </div>

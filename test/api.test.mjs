@@ -538,8 +538,11 @@ test('PUT /api/settings：4 → 400、5 → 200、101 → 400', async () => {
   const ok5 = await dispatch(ctx, '/api/settings', { method: 'PUT', cookie, body: { retentionRuns: 5 } });
   assert.equal(ok5.status, 200);
   assert.equal(ok5.body.data.retentionRuns, 5);
-  assert.equal(ok5.body.data.cronUtc, '0 1 * * *');
-  assert.equal(ok5.body.data.cronLocal, '09:00');
+  // 默认签到小时是北京时间 08:00，对应 UTC 00:00；cronUtc/cronLocal 现在是「时刻」而非表达式
+  assert.equal(ok5.body.data.checkinHour, 8);
+  assert.equal(ok5.body.data.cronUtc, '00:00');
+  assert.equal(ok5.body.data.cronLocal, '08:00');
+  assert.equal(ok5.body.data.cronIntervalMinutes, 15);
   assert.equal(typeof ok5.body.data.kvWritesToday, 'number');
 });
 
@@ -787,7 +790,9 @@ test('F3 补充：GET /api/settings 形状不变（不泄漏 PUT 独有的 evict
   const { ctx, cookie } = await createAuthedEnv();
 
   const got = await dispatch(ctx, '/api/settings', { cookie });
-  assert.deepEqual(Object.keys(got.body.data).sort(), ['cronLocal', 'cronUtc', 'kvWritesToday', 'retentionRuns']);
+  assert.deepEqual(Object.keys(got.body.data).sort(), [
+    'checkinHour', 'cronIntervalMinutes', 'cronLocal', 'cronUtc', 'kvWritesToday', 'retentionRuns',
+  ]);
   assert.equal('evicted' in got.body.data, false);
   assert.equal('evictFailed' in got.body.data, false);
 });
@@ -836,7 +841,8 @@ test('F1 补充：kvWritesToday 不超过真实写次数（不双计 run 写入�
   assert.equal(run.body.data.summary.kvWriteCount, 4);
 
   const realWrites = kv.writeCount();
-  assert.equal(realWrites, 5, '真实写：setup 1 + run 4');
+  // setup 1 + run 4 + 当日签到进度 checkin:day 1
+  assert.equal(realWrites, 6, '真实写：setup 1 + run 4 + 进度 1');
 
   const settings = await dispatch(ctx, '/api/settings', { cookie });
   const reported = settings.body.data.kvWritesToday;

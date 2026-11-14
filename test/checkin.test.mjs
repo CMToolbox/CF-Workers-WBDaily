@@ -258,12 +258,17 @@ test('请求形状：POST / 两个精确 URL / Bearer 头 / application/json / b
     assert.equal(call.contentType, 'application/json');
     assert.equal(call.authorization, `Bearer ${TOKEN}`, '录入口的 Bearer 前缀与空格必须被清洗');
     assert.equal(call.body, '{}');
-    // 请求头贴近官方客户端/浏览器：降低 WorkBuddy 边缘风控误判概率
-    assert.equal(call.headers.accept, 'application/json');
-    assert.equal(call.headers['accept-language'], 'zh-CN');
+    // 请求头取值对齐官方 Web 客户端（见 src/upstream-headers.js 的来源说明）
+    assert.equal(call.headers.accept, 'application/json, text/plain, */*');
+    assert.equal(call.headers['accept-language'], 'zh-CN,zh;q=0.9');
     assert.match(call.headers['user-agent'], /^Mozilla\/5\.0 \(Windows NT 10\.0/);
     assert.equal(call.headers.origin, 'https://copilot.tencent.com');
     assert.equal(call.headers.referer, 'https://copilot.tencent.com/');
+    // uid 为空时不得发送空的业务头（发空串比不发更容易被判定异常）
+    assert.equal('x-user-id' in call.headers, false);
+    assert.equal('x-enterprise-id' in call.headers, false);
+    assert.equal('x-tenant-id' in call.headers, false);
+    assert.equal('x-domain' in call.headers, false);
   }
 });
 

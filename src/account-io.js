@@ -80,6 +80,10 @@ export function normalizeImportItem(raw, index = 0) {
   const domainRaw = raw.domain;
   const domain = typeof domainRaw === 'string' ? domainRaw.trim().slice(0, UID_MAX) : '';
 
+  // 企业 ID：上游部分接口要求 X-Enterprise-Id / X-Tenant-Id，与 uid 一起决定租户上下文
+  const enterpriseRaw = raw.enterprise_id ?? raw.enterpriseId;
+  const enterpriseId = typeof enterpriseRaw === 'string' ? enterpriseRaw.trim().slice(0, UID_MAX) : '';
+
   const nick = typeof raw.nickname === 'string' ? raw.nickname.trim() : '';
   const email = typeof raw.email === 'string' ? raw.email.trim() : '';
   const name = truncate(nick || email || `导入账号 ${index + 1}`, NAME_MAX);
@@ -88,6 +92,7 @@ export function normalizeImportItem(raw, index = 0) {
   const item = { name, token, uid };
   if (refreshToken) item.refreshToken = refreshToken;
   if (domain) item.domain = domain;
+  if (enterpriseId) item.enterpriseId = enterpriseId;
   return { ok: true, item };
 }
 
@@ -150,6 +155,10 @@ export function mergeImportedAccounts(existing, incoming, options) {
         matched.domain = item.domain;
         changed = true;
       }
+      if (!matched.enterpriseId && item.enterpriseId) {
+        matched.enterpriseId = item.enterpriseId;
+        changed = true;
+      }
       if (!matched.name && item.name) {
         matched.name = item.name;
         changed = true;
@@ -178,6 +187,7 @@ export function mergeImportedAccounts(existing, incoming, options) {
     };
     if (item.refreshToken) fresh.refreshToken = item.refreshToken;
     if (item.domain) fresh.domain = item.domain;
+    if (item.enterpriseId) fresh.enterpriseId = item.enterpriseId;
     accounts.push(fresh);
     imported += 1;
   }
@@ -220,6 +230,7 @@ export async function buildCockpitExport(accounts, nowMs) {
     }
     if (account.uid) row.uid = account.uid;
     if (account.domain) row.domain = account.domain;
+    if (account.enterpriseId) row.enterprise_id = account.enterpriseId;
     if (account.name) row.nickname = account.name;
     result.push(row);
   }

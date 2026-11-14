@@ -19,13 +19,16 @@
 │ app.js       │  JSON  │   ├─ /api/mcp      ──▶ 鉴权(Bearer Key) ──▶ MCP 工具 ──┤          │
 │ styles.css   │◀───────│   └─ 其它路径      ──▶ ASSETS（静态文件）            │          │
 └──────────────┘        │                                                       ▼          │
-                        │  Cron Trigger ──▶ run.js ──▶ checkin.js ──▶ copilot.tencent.com │
+                        │  Cron(每15分钟) ──▶ schedule 判定 ──▶ run.js ──▶ checkin.js ─▶ 上游 │
                         │                                                       │          │
                         │                            store.js ──▶ KV (WB_KV) ◀──┘          │
                         └──────────────────────────────────────────────────────────────────┘
 ```
 
 三层结构：`index`（分流）→ `api / mcp / run`（业务）→ `store`（KV 封装），工具函数在 `util / router / auth / checkin / logger`。所有业务函数首参是 `ctx`，KV、`fetch`、时钟全部注入，方便单测。
+
+Cron 不再直接签到：`index.scheduled()` 先让 `schedule.js` 判断「当前北京小时是否等于签到小时」，命中才调 `run.js`，
+其余触发零写返回；`upstream-headers.js` 统一三条上游链路的请求头，`upstream-token.js` 负责 access_token 的续期。
 
 ## 前置要求
 
@@ -88,8 +91,9 @@ npm test
 3. **测试签到**：某行右侧「测试签到」立刻跑一次，结果会以徽标形式出现在该账号行上（最近一次结果）。
 4. **立即全部签到**：只跑「启用」的账号；执行期间按钮禁用，完成后弹「成功 x / 共 y」。
 5. **看日志**：「执行记录」列出每次执行的时间、触发方式（定时/手动/单账号）、成功数与耗时；点一行展开逐账号明细（HTTP 状态、业务 code、上游 message、连续天数、额度）。
-6. **MCP Key**：「设置」→「MCP 接口」→ 生成 Key，**明文只显示一次**。
-7. **导入/导出账号**：账号区「导入」选 `cockpit-tools` 导出的 `workbuddy_accounts_*.json`；每张账号卡片底部的「导出」按钮只导出**该账号**的 JSON（文件名形如 `workbuddy_account_<账号名>_<日期>.json`），账号区顶部的「导出全部」用于批量备份（生成 `workbuddy_accounts_<日期>.json`）。两者都**含明文 token**，都会二次确认，请妥善保管。重复导入按 uid 优先、token 兜底匹配，不会重复添加；导入后超过 10 个账号会整批拒绝。
+6. **设定签到时间**：「设置」→「签到时间（北京时间）」选整点（0~23）→ 保存，**即时生效、不用重新部署**。详见「[签到时间与调度](#签到时间与调度)」。
+7. **MCP Key**：「设置」→「MCP 接口」→ 生成 Key，**明文只显示一次**。
+8. **导入/导出账号**：账号区「导入」选 `cockpit-tools` 导出的 `workbuddy_accounts_*.json`；每张账号卡片底部的「导出」按钮只导出**该账号**的 JSON（文件名形如 `workbuddy_account_<账号名>_<日期>.json`），账号区顶部的「导出全部」用于批量备份（生成 `workbuddy_accounts_<日期>.json`）。两者都**含明文 token**，都会二次确认，请妥善保管。重复导入按 uid 优先、token 兜底匹配，不会重复添加；导入后超过 10 个账号会整批拒绝。
 
 ## MCP 接入
 
@@ -143,25 +147,42 @@ curl -sS https://cf-workers-wbdaily.<你的子域>.workers.dev/api/mcp \
 
 工具级错误不会中断会话，而是以 `isError:true` 的文本返回（例如 `CONFLICT: 已有任务在执行（run_xxx）`）；只有 Key 错误才返回 HTTP 401。
 
-## 修改 Cron 时间
+## 签到时间与调度
 
-默认 `[triggers] crons = ["0 1 * * *"]`，即 **01:00 UTC = 09:00 Asia/Shanghai**。想改成北京时间 08:30：
+签到时刻不写死在 cron 里，改在面板「设置 → 签到时间（北京时间）」选整点（0~23），**保存即生效，不需要重新部署**。
 
-```toml
-[triggers] crons = ["30 0 * * *"]
-```
+### 为什么是「每 15 分钟轮询」而不是「每天定点一次」
 
-改完必须重新 `npm run deploy` 才会生效。Cron 表达式是 UTC，换算时减 8 小时。
+`wrangler.toml` 里固定 `crons = ["*/15 * * * *"]`，每 15 分钟触发一次；`scheduled()` 先读一次 `settings`，
+只有「当前北京时间小时 == `checkinHour`」时才真正干活，其余 95 次触发**只读 1 次 KV 就返回**（零写、零上游请求）。
+
+Cloudflare 的 cron 触发不保证准点（边缘调度 + 实例冷启动可能延迟几分钟），单个 `0 0 * * *` 一旦错过就整天不签。
+改成按小时归属后，目标小时内的 `:00 / :15 / :30 / :45` 共 4 轮都算这个窗口：
+
+- 第一轮成功后把结果写进 KV 的 `checkin:day`，后 3 轮读到达标即短路（零写、零上游请求）；
+- 第一轮失败（5xx / 403 / 超时）不写进度，后 3 轮自动成为**重试机会**；
+- 部分成功时只对剩下的账号发起请求，已完成的不会重复打上游。
+
+判定用的是**本轮 cron 的 `scheduledTime`**，不是执行时刻：即使实例冷启动延迟到 08:03 才跑，仍按 08:00 这轮归属，
+不会因为跨点而漏签。
+
+### 改签到小时
+
+面板设置里选完点保存即可。只有想改「轮询频率」本身（比如想更密地重试）才需要动 `wrangler.toml` 并重新 `npm run deploy`。
+
+`checkinHour` 是**北京时间整点**，与 cron 的 UTC 表达式解耦，不需要自己换算；面板同时会显示它对应的 UTC 时刻。
 
 ## 免费额度与成本
 
 | 项目 | 免费额度 | 本项目的用量 |
 | --- | --- | --- |
-| KV 写入 | 1000 次/天 | 常规一次签到 **4 次**（抢锁 / 明细 / 索引 / 解锁）；命中淘汰的 run 为 **5 次**（多一次删最旧明细） |
-| KV 读取 | 100,000 次/天 | 面板首屏约 4 次，轮询每次 3 次，签到每账号 1~2 次 |
-| Worker 请求 | 100,000 次/天 | 每天 1 次 Cron + 你自己开面板的次数 |
+| KV 写入 | 1000 次/天 | 常规一次签到 **4 次**（抢锁 / 明细 / 索引 / 解锁）+ **1 次**进度标记；命中淘汰的 run 再多一次 |
+| KV 读取 | 100,000 次/天 | Cron 每次触发 1 次（读 settings）；签到小时那 4 轮再多 2 次；面板首屏约 4 次，轮询每次 3 次 |
+| Worker 请求 | 100,000 次/天 | 每天 **96 次 Cron**（每 15 分钟）+ 你自己开面板的次数 |
 
-所以每天自动跑一次大约只用掉 **4~5 次写入**，10 个账号也一样（批量写集中在一次收尾，循环里零写入）。导入 N 个账号只写 **1 次**（整批一次 `putAccounts`），导出与额度查询各 **0 次**。
+Cron 从「每天 1 次」变成「每天 96 次」，但其中 **92 次只读 1 次 KV 就返回**，不写 KV、不碰上游。
+真正签到的那一轮仍然是 4~5 次写，10 个账号也一样（批量写集中在一次收尾，循环里零写入）。
+导入 N 个账号只写 **1 次**（整批一次 `putAccounts`），导出与额度查询各 **0 次**。
 
 **调低「日志保留条数」时的一次性开销**：保存设置的那一刻会立即清理超额的旧记录（先删明细、再写回裁剪后的索引），所以那一次 `PUT /api/settings` 会产生 `N+1` 次写入（N = 被清理的条数）。这就是面板可能提示「设置已保存，同时清理了 N 条旧记录」的原因。这样做是为了让后续每次 run 最多只淘汰 1 条、稳定在 4~5 写，而不是攒到下一次 run 一次删几十条。
 
@@ -176,6 +197,33 @@ curl -sS https://cf-workers-wbdaily.<你的子域>.workers.dev/api/mcp \
 5. **CORS 未开启**：面板与 API 同源部署，写操作还会校验 `Origin`/`Referer`；MCP 走独立的 Bearer Key，不受同源限制。
 6. **`SETUP_TOKEN` 建议一定要配**，否则存在「被抢先初始化」的风险。
 7. **导出的 JSON 含明文 token**：与 KV 里的存储方式一致，拿到文件等于拿到账号；卡片内单账号导出与顶部「导出全部」都会二次确认，请勿放进 Git、网盘公开链接或聊天记录。
+8. **上游请求头能被上游识别出「来自 Worker」，且无法消除**。所有出站 `fetch` 会被 Cloudflare 强制追加
+   `cf-worker: <worker 名>`（本地实测：`cf-workers-wbdaily.example.com`；生产是 `<worker>.<子域>.workers.dev`），
+   这个头**不能通过 headers 删除**。也就是说：UA、`Origin`、`Accept` 伪装得再完整，上游只要看这一个头就知道流量来自 Workers。
+   本项目已把其余头对齐官方 Web 客户端（见下节），但如果上游是按「来源是否 Cloudflare Worker」处置，
+   请求头层面无解 —— 唯一出路是自建中转，并用 `UPSTREAM_BASE_URL` / `CREDITS_BASE_URL` / `REFRESH_BASE_URL` 指过去。
+9. **TLS / HTTP2 指纹无法伪造**：Workers 的出口握手特征与 Chrome 完全不同。因此项目**没有**堆砌
+   `sec-ch-ua`、`sec-fetch-*` 这类只有真浏览器才有的头 —— 「自称 Chrome、TLS 不像、还带 cf-worker」的组合比朴素请求更违和。
+
+## 上游请求头对齐
+
+签到 / 额度 / token 续期三条链路的请求头由 `src/upstream-headers.js` 统一构造，避免同一账号在不同接口呈现不同特征：
+
+| 头 | 值 | 说明 |
+| --- | --- | --- |
+| `accept` | `application/json, text/plain, */*` | 与官方 Web 客户端一致 |
+| `accept-language` | `zh-CN,zh;q=0.9` | 同上 |
+| `content-type` | `application/json` | body 恒为 `{}` |
+| `authorization` | `Bearer <access_token>` | |
+| `user-agent` | Chrome 131 / Windows | 浏览器基线，已验证可用 |
+| `origin` / `referer` | `https://copilot.tencent.com` | |
+| `x-user-id` | 账号 `uid` | **有值才发** |
+| `x-enterprise-id` / `x-tenant-id` | 账号 `enterpriseId` | 同上，两个头同值 |
+| `x-domain` | 账号 `domain` | 同上 |
+| `x-refresh-token` / `x-auth-refresh-source` | 仅续期接口 | 后者固定 `plugin`，缺失会被网关判定为其它 client |
+
+空值**不发空串**：`X-User-Id: ` 这种空头比不带更容易被判异常。业务头的取值来源是账号记录，
+从 cockpit-tools 导入时 `uid` / `enterpriseId` / `domain` 会被一并保留。
 
 ## 故障排查
 
@@ -191,6 +239,9 @@ curl -sS https://cf-workers-wbdaily.<你的子域>.workers.dev/api/mcp \
 | 设置页提示「系统已初始化」（409） | KV 里已有 `config:auth`。要重新初始化请按下方「彻底重置」处理（注意：只删 `config:auth` 会保留账号与 token） |
 | 登录提示「尝试过于频繁」 | 5 次密码错误后进入退避（30s 起，逐次翻倍，封顶 15min），等倒计时结束或换网络环境 |
 | 签到提示「已有任务在执行」 | 有别的 run 持有锁（`lock:run`，TTL 300s）。等 5 分钟或等上一次跑完 |
+| 到点了但没签到 | 先看面板「签到时间」是不是目标小时（**北京时间整点**，不是 UTC）；再 `npx wrangler tail --search cron_tick` 看每轮触发日志里的 `beijingHour` / `targetHour`。若 `cron_tick` 根本没有，说明 `wrangler.toml` 的 `crons` 没部署上去，重新 `npm run deploy` |
+| 想确认某天是否真的签过 | `wrangler kv key get --namespace-id <id> --remote "checkin:day"`；只有成功（`checked_in` / `already_checked_in`）才会出现在里面，失败不入库因此会重试 |
+| 想把调度换成别的频率 | 只需改面板的签到小时；只有当你想改「每小时重试几次」时才动 `wrangler.toml` 的 `crons`（必须仍是每 15 分钟的整数倍，否则会漏窗口） |
 | 想看运行日志 | `npx wrangler tail`（结构化单行 JSON，可用 `--search run_finished` 过滤） |
 
 彻底重置（清空所有数据，**不可恢复**）：
@@ -226,6 +277,9 @@ npx wrangler kv namespace delete WB_KV
 │   ├── logger.js     run 内存日志缓冲 + 64KB 截断汇总
 │   ├── run.js        签到编排：抢锁 → 串行执行 → 收尾落盘 → 解锁
 │   ├── api.js        22 条 REST 路由 + 可复用的服务函数
+│   ├── schedule.js   签到调度纯函数：北京时区换算、签到小时判定、当日进度合并
+│   ├── upstream-headers.js 上游请求头唯一事实来源（签到/额度/续期共用）
+│   ├── upstream-token.js   access_token 生命周期：JWT exp 判定 + refresh 续期 + 回写
 │   └── mcp.js        MCP JSON-RPC 分发 + 5 个工具
 ├── public
 │   ├── index.html    三态视图骨架（setup / login / panel）
@@ -238,17 +292,18 @@ npx wrangler kv namespace delete WB_KV
 
 ## 数据存储
 
-全部数据在 **1 个 KV 命名空间**（`WB_KV`）里，共 7 类键（其中 `log:run:{runId}` 每个 run 一个，条数受「日志保留条数」限制）：
+全部数据在 **1 个 KV 命名空间**（`WB_KV`）里，共 8 类键（其中 `log:run:{runId}` 每个 run 一个，条数受「日志保留条数」限制）：
 
 | 键 | 内容 |
 | --- | --- |
 | `config:auth` | 管理员密码哈希、会话密钥、`sessionVersion` |
-| `config:settings` | 日志保留条数、Cron 展示信息 |
+| `config:settings` | 日志保留条数 `retentionRuns`、签到小时 `checkinHour`（北京时间 0~23） |
 | `config:mcp` | MCP Key 的 sha256（不存明文） |
 | `accounts` | 账号数组（token 明文，最多 10 个） |
 | `log:index` | 执行记录索引（倒序，≤ 保留条数） |
 | `log:run:{runId}` | 单次执行明细（≤ 64KB，超出自动截断） |
 | `lock:run` | 互斥锁（TTL 300s） |
+| `checkin:day` | 当日签到进度 `{date, accounts:{id:{result,at}}}`，只记成功；cron 后 3 轮靠它零写短路，跨天自动作废 |
 
 ## License
 

@@ -163,19 +163,19 @@ test('fetchAccountCredits：三次请求并发、头与 body 正确、付费/免
   assert.deepEqual(new Set(mock.paths()), new Set(Object.values(PATHS)));
 
   for (const call of mock.calls) {
-    assert.equal(call.headers.Authorization, `Bearer ${TOKEN}`);
-    assert.equal(call.headers['X-User-Id'], UID);
-    assert.equal(call.headers['Content-Type'], 'application/json');
+    assert.equal(call.headers.authorization, `Bearer ${TOKEN}`);
+    assert.equal(call.headers['x-user-id'], UID);
+    assert.equal(call.headers['content-type'], 'application/json');
     // 与 checkin.js 同口径的浏览器特征头：额度接口恰恰是线上被 403 风控的那条链路
     assert.equal(
-      call.headers['User-Agent'],
+      call.headers['user-agent'],
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       'User-Agent 必须与 checkin.js 的 CLIENT_USER_AGENT 完全一致',
     );
-    assert.equal(call.headers.Origin, 'https://copilot.tencent.com');
-    assert.equal(call.headers.Referer, 'https://copilot.tencent.com/');
-    assert.equal(call.headers.Accept, 'application/json');
-    assert.equal(call.headers['Accept-Language'], 'zh-CN');
+    assert.equal(call.headers.origin, 'https://copilot.tencent.com');
+    assert.equal(call.headers.referer, 'https://copilot.tencent.com/');
+    assert.equal(call.headers.accept, 'application/json, text/plain, */*');
+    assert.equal(call.headers['accept-language'], 'zh-CN,zh;q=0.9');
   }
 
   const paidBody = mock.calls.find((call) => call.path === PATHS.paid).body;
@@ -308,7 +308,7 @@ test('fetchAccountCredits：首次 403、重试 200 → 整体成功（验证重
 test('CreditsError.message 带响应体片段（去换行、≤120 字符），且必然剔除 token', async () => {
   const mock = mockUpstream({
     // 故意让上游把请求头回显到 body 里，验证 message 不会泄漏 token
-    summary: ({ headers }) => textRes(`<html>\n<title>403 Forbidden</title>\n${headers.Authorization}\n</html>`, 403),
+    summary: ({ headers }) => textRes(`<html>\n<title>403 Forbidden</title>\n${headers.authorization || headers.Authorization}\n</html>`, 403),
     paid: () => jsonRes({}),
     free: () => jsonRes({}),
   });

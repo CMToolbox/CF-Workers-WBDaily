@@ -25,6 +25,7 @@
 // 约束：不访问裸 env / 全局 fetch / Date.now()（时间一律 ctx.now()，fetch 一律 ctx.fetch）。
 
 import { b64urlDecodeText, isoNow, truncate } from './util.js';
+import { buildUpstreamHeaders } from './upstream-headers.js';
 
 /** access_token 过期判定时使用的默认提前刷新窗口（毫秒）。 */
 const DEFAULT_REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -40,12 +41,6 @@ const DEFAULT_REFRESH_BASE = 'https://copilot.tencent.com';
 
 /** 刷新端点路径。 */
 const REFRESH_PATH = '/v2/plugin/auth/token/refresh';
-
-/** 官方 Origin（请求头 origin/referer 用）。 */
-const UPSTREAM_ORIGIN = 'https://copilot.tencent.com';
-
-/** 模拟官方客户端 UA：与 checkin.js / credits.js 的值必须保持一致。 */
-const CLIENT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /** 刷新失败原因分类。 */
 export class TokenRefreshError extends Error {
@@ -189,24 +184,19 @@ function refreshSkewMs(ctx) {
 }
 
 /**
- * 组装刷新请求头。顺序与 cockpit-tools 一致。
+ * 组装刷新请求头：公共头走统一模块，再叠加刷新接口专属的两个字段。
+ * `X-Refresh-Token` 与 `X-Auth-Refresh-Source: plugin` 缺一不可，实测缺失时网关会
+ * 把刷新判定成其它 client 来源（400 refreshToken is empty / invalid_grant）。
  * @param {object} account
  * @returns {Record<string,string>}
  */
 function refreshHeaders(account) {
-  const headers = {
-    authorization: `Bearer ${account.token}`,
-    'x-refresh-token': account.refreshToken,
-    'x-auth-refresh-source': 'plugin',
-    'content-type': 'application/json',
-    accept: 'application/json',
-    'accept-language': 'zh-CN',
-    'user-agent': CLIENT_USER_AGENT,
-    origin: UPSTREAM_ORIGIN,
-    referer: `${UPSTREAM_ORIGIN}/`,
-  };
-  if (typeof account.domain === 'string' && account.domain) headers['x-domain'] = account.domain;
-  return headers;
+  return buildUpstreamHeaders(account, {
+    extra: {
+      'x-refresh-token': account.refreshToken,
+      'x-auth-refresh-source': 'plugin',
+    },
+  });
 }
 
 /**

@@ -16,6 +16,7 @@
 
 import { AppError, truncate } from './util.js';
 import { ensureFreshToken, tokenExpiresAtMs } from './upstream-token.js';
+import { bearerOf, buildUpstreamHeaders } from './upstream-headers.js';
 
 const BASE = 'https://copilot.tencent.com';
 
@@ -327,38 +328,13 @@ function shanghaiDate(ms) {
 }
 
 /**
- * 模拟官方客户端/浏览器的 UA：与 checkin.js 的 CLIENT_USER_AGENT 保持完全一致。
- * 额度接口正是线上被上游边缘（EdgeOne/APISIX）风控返回 403 的那条链路，
- * 因此同样补齐浏览器特征头以降低误判概率。两处值必须同步修改。
+ * 组装额度接口请求头。
+ * 字段定义统一收敛到 upstream-headers.js（与签到/续期共用），这里不再单独维护一份，
+ * 避免「签到带了 X-User-Id、额度没带」这类同账号特征不一致的疏漏。
+ * @param {object} account @returns {Record<string,string>}
  */
-const CLIENT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-/** 官方 Origin（请求头 origin/referer 用，即使 base 被中转覆盖也保持官方值）。 */
-const UPSTREAM_ORIGIN = 'https://copilot.tencent.com';
-
-/** @param {object} account @returns {Record<string,string>} */
 function creditHeaders(account) {
-  return {
-    Authorization: `Bearer ${account.token}`,
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-    'Accept-Language': 'zh-CN',
-    'User-Agent': CLIENT_USER_AGENT,
-    Origin: UPSTREAM_ORIGIN,
-    Referer: `${UPSTREAM_ORIGIN}/`,
-    'X-User-Id': typeof account.uid === 'string' ? account.uid : '',
-  };
-}
-
-/**
- * 从请求头里取裸 token（用于错误信息脱敏，绝不外泄）。
- * @param {Record<string,string>|null|undefined} headers
- * @returns {string}
- */
-function bearerOf(headers) {
-  if (!headers || typeof headers !== 'object') return '';
-  const raw = headers.Authorization || headers.authorization;
-  return typeof raw === 'string' ? raw.replace(/^Bearer\s+/i, '').trim() : '';
+  return buildUpstreamHeaders(account);
 }
 
 /**

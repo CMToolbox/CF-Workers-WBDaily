@@ -5,12 +5,10 @@
 // 安全：任何 message 都可能进入日志与面板，**永不包含 token 或其片段**。
 
 import { sanitizeToken, truncate } from './util.js';
+import { buildUpstreamHeaders } from './upstream-headers.js';
 
 /** 上游默认基址（官方接口）。 */
 export const UPSTREAM_BASE = 'https://copilot.tencent.com';
-
-/** 官方 Origin（请求头 origin/referer 用，即使 base 被中转覆盖也保持官方值）。 */
-const UPSTREAM_ORIGIN = 'https://copilot.tencent.com';
 
 /** 今日签到状态查询路径。 */
 const STATUS_PATH = '/v2/billing/meter/checkin-status';
@@ -29,9 +27,6 @@ const UPSTREAM_TEXT_MAX_CHARS = 2000;
 
 /** 上游业务码：今天已签到（同一天重复签到，属于幂等场景）。 */
 const CODE_ALREADY_CHECKED_IN = 10001;
-
-/** 模拟官方客户端/浏览器的 UA：降低 WorkBuddy 边缘（EdgeOne/APISIX）风控误判概率。 */
-const CLIENT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /**
  * 上游基址：默认官方地址，env.UPSTREAM_BASE_URL 可覆盖（仅 http(s):// 开头才生效）。
@@ -143,33 +138,27 @@ function alreadyCheckedIn(httpStatus, json) {
 }
 
 /**
- * 组装一次上游请求的请求头：尽量贴近官方客户端/浏览器，降低被边缘风控拦截的概率。
- * @param {string} token 裸 token
+ * 组装一次上游请求的请求头。
+ * 具体字段与取值统一由 upstream-headers.js 维护（签到/额度/续期三条链路共用一套，
+ * 避免同一账号在不同接口呈现不同客户端特征）。这里只负责传入账号上下文。
+ * @param {object} account 含裸 token，可选 uid / enterpriseId / domain
  * @returns {Record<string,string>}
  */
-function buildHeaders(token) {
-  return {
-    'content-type': 'application/json',
-    authorization: `Bearer ${token}`,
-    accept: 'application/json',
-    'accept-language': 'zh-CN',
-    'user-agent': CLIENT_USER_AGENT,
-    origin: UPSTREAM_ORIGIN,
-    referer: `${UPSTREAM_ORIGIN}/`,
-  };
+function buildHeaders(account) {
+  return buildUpstreamHeaders(account);
 }
 
 /**
  * 上游调用：POST 空 JSON body，带 Bearer token，AbortController 控超时。
  * @param {object} ctx
  * @param {string} path 以 `/` 开头
- * @param {string} token 裸 token
+ * @param {object} account 含裸 token（必需），可带 uid / enterpriseId / domain 以补齐业务头
  * @param {{timeoutMs?:number}} [options]
  * @returns {Promise<{httpStatus:number, json:any, text:string,
  *                    error:null|'TIMEOUT'|'NETWORK'|'BAD_JSON',
  *                    durationMs:number, errorName:string|null}>}
  */
-export async function callUpstream(ctx, path, token, options = {}) {
+export async function callUpstream(ctx, path, account, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
     ? Math.floor(options.timeoutMs)
     : DEFAULT_TIMEOUT_MS;
@@ -202,7 +191,7 @@ export async function callUpstream(ctx, path, token, options = {}) {
   const requestPromise = (async () => {
     const response = await ctx.fetch(url, {
       method: 'POST',
-      headers: buildHeaders(token),
+      headers: buildHeaders(account),
       body: '{}',
       signal: controller.signal,
     });
@@ -381,7 +370,7 @@ export async function checkinStatus(ctx, account, options = {}) {
   if (!token) {
     return failed({ message: 'Token 为空，请在面板重新填写' });
   }
-  const call = await callUpstream(ctx, STATUS_PATH, token, options);
+  const call = await callUpstream(ctx, STATUS_PATH, { ...acc, token }, options);
   const failure = classifyFailure(call, 'status');
   if (failure) return { ...failure, durationMs: call.durationMs };
 
@@ -439,7 +428,7 @@ export async function checkinAccount(ctx, account, options = {}) {
   }
 
   // 第一段：查询今日签到状态
-  const statusCall = await callUpstream(ctx, STATUS_PATH, token, options);
+  const statusCall = await callUpstream(ctx, STATUS_PATH, { ...acc, token }, options);
   const statusFailure = classifyFailure(statusCall, 'status');
   if (statusFailure) return { ...statusFailure, durationMs: elapsed() };
 
@@ -462,7 +451,7 @@ export async function checkinAccount(ctx, account, options = {}) {
   }
 
   // 第二段：执行签到
-  const dailyCall = await callUpstream(ctx, DAILY_PATH, token, options);
+  const dailyCall = await callUpstream(ctx, DAILY_PATH, { ...acc, token }, options);
   const dailyFailure = classifyFailure(dailyCall, 'daily');
   if (dailyFailure) return { ...dailyFailure, durationMs: elapsed() };
 

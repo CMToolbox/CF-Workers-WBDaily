@@ -221,7 +221,7 @@ test('credits 业务码失败（kind=api）：确定性结论，绝不重试', a
 
 test('credits 响应非 JSON（2xx）：不重试，且 message 片段不含 token', async () => {
   const mock = creditsUpstream({
-    summary: ({ headers }) => textRes(`<html>gateway${headers.Authorization}</html>`, 200),
+    summary: ({ headers }) => textRes(`<html>gateway${headers.authorization || headers.Authorization}</html>`, 200),
     paid: () => jsonRes({ code: 0, data: { Accounts: [], TotalCount: 0 } }),
     free: () => jsonRes({ code: 0, data: { Accounts: [], TotalCount: 0 } }),
   });

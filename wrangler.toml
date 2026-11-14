@@ -16,9 +16,13 @@ not_found_handling = "none"
 binding = "WB_KV"
 id = "c2ae825de41b4d3a83d97f358a87d5fa" #改成你自己的KV数据库id
 
-# 每日 01:00 UTC（= 09:00 Asia/Shanghai）
+# 每 15 分钟轮询一次（UTC）。真正的签到时刻由面板的「签到小时」（北京时间 0~23）决定：
+# scheduled() 只在当前北京时间小时 == checkinHour 时才干活，其余触发只读 1 次 settings 就返回。
+# 目标小时内的 :00/:15/:30/:45 共 4 轮 —— 第一轮成功后写 checkin:day 标记，后 3 轮零写短路；
+# 第一轮失败则后 3 轮自动成为重试机会。这是为了对抗 Cloudflare cron 的分钟级漂移，
+# 单点触发一旦错过就整天不签，所以不能用 "0 1 * * *"。
 [triggers]
-crons = ["0 1 * * *"]
+crons = ["*/15 * * * *"]
 
 [vars]
 # 免费版单请求 CPU 上限 10ms，PBKDF2 迭代必须压低，否则登录会 1102。

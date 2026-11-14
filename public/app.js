@@ -65,6 +65,7 @@ const state = {
     key: false,
     pw: false,
     retention: false,
+    checkinHour: false,
     setup: false,
     login: false,
   },
@@ -789,8 +790,10 @@ function renderSettings() {
   const settings = state.settings;
   if (settings) {
     $('#retention-input').value = String(settings.retentionRuns);
-    $('#cron-local').textContent = settings.cronLocal || '09:00';
-    $('#cron-utc').textContent = settings.cronUtc || '0 1 * * *';
+    const hour = Number.isFinite(Number(settings.checkinHour)) ? Number(settings.checkinHour) : 8;
+    $('#checkin-hour-select').value = String(hour);
+    $('#cron-local').textContent = settings.cronLocal || '08:00';
+    $('#cron-utc').textContent = settings.cronUtc || '00:00';
   }
   $('#settings-version').textContent = state.version || '1.0.0';
 
@@ -815,6 +818,7 @@ function syncBusy() {
   $('#btn-refresh').disabled = state.busy.run;
   $('#btn-add-account').disabled = state.busy.run;
   $('#btn-save-retention').disabled = state.busy.retention;
+  $('#btn-save-checkin-hour').disabled = state.busy.checkinHour;
   $('#btn-gen-mcp').disabled = state.busy.key;
   $('#btn-change-pw').disabled = state.busy.pw;
   $('#btn-setup').disabled = state.busy.setup;
@@ -1600,6 +1604,49 @@ async function saveRetention() {
 }
 
 /**
+ * 初始化「签到时间」下拉（0~23 整点，北京时间）。
+ * 只在首次渲染时填充一次，避免每次 renderSettings 重建 DOM 丢掉用户的选择。
+ */
+function initCheckinHourOptions() {
+  const select = $('#checkin-hour-select');
+  if (!select || select.options.length > 0) return;
+  for (let hour = 0; hour < 24; hour += 1) {
+    const option = document.createElement('option');
+    option.value = String(hour);
+    option.textContent = `${String(hour).padStart(2, '0')}:00`;
+    select.appendChild(option);
+  }
+}
+
+/**
+ * 保存「签到时间」。
+ * 只提交 checkinHour，不动 retentionRuns：后端已把两个字段改成各自可选，
+ * 避免为了改时间顺带重算日志淘汰。
+ */
+async function saveCheckinHour() {
+  const hour = Number($('#checkin-hour-select').value);
+  const hint = $('#checkin-hour-hint');
+  hint.hidden = true;
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+    setError('BAD_REQUEST', '签到时间需为 0~23 的整点');
+    return;
+  }
+  state.busy.checkinHour = true;
+  syncBusy();
+  try {
+    state.settings = await api('/api/settings', { method: 'PUT', body: { checkinHour: hour } });
+    renderSettings();
+    hint.hidden = false;
+    toast(`签到时间已设为每天 ${String(hour).padStart(2, '0')}:00（北京时间）`, 'ok');
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 401) setError(err.code || 'INTERNAL', err.message || '保存失败');
+  } finally {
+    state.busy.checkinHour = false;
+    syncBusy();
+  }
+}
+
+/**
  * 生成/重置 MCP Key。
  * @param {boolean} rotate 是否需要二次确认（重置）
  */
@@ -1749,6 +1796,8 @@ function bindEvents() {
   $('#btn-export-accounts').addEventListener('click', askExportAccounts);
   $('#btn-clear-logs').addEventListener('click', askClearLogs);
   $('#btn-save-retention').addEventListener('click', saveRetention);
+  initCheckinHourOptions();
+  $('#btn-save-checkin-hour').addEventListener('click', saveCheckinHour);
   $('#btn-gen-mcp').addEventListener('click', () => requestMcpKey(Boolean(state.mcpKey && state.mcpKey.exists)));
   $('#btn-change-pw').addEventListener('click', changePassword);
   $('#btn-copy-key').addEventListener('click', copyMcpKey);
