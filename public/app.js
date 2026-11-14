@@ -16,7 +16,6 @@ const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 const ICONS = Object.freeze({
   plus: 'i-plus',
   play: 'i-play',
-  refresh: 'i-refresh',
   edit: 'i-edit',
   trash: 'i-trash',
   upload: 'i-upload',
@@ -1870,7 +1869,6 @@ function syncBusy() {
     }
   };
 
-  setState('#btn-refresh', state.busy.run);
   setState('#btn-add-account', state.busy.run);
   setState('#btn-import-accounts', state.busy.run || state.busy.import, state.busy.import);
   setState('#btn-clear-logs', state.busy.run);
@@ -2822,11 +2820,6 @@ function bindEvents() {
   });
 
   $('#btn-logout').addEventListener('click', doLogout);
-  $('#btn-refresh').addEventListener('click', async () => {
-    await loadPanel();
-    await loadAllCredits({ silent: true });
-    toast('已刷新', 'info');
-  });
   $('#btn-run-all').addEventListener('click', runAll);
   $('#btn-add-account').addEventListener('click', () => openAccountDialog(null));
   $('#btn-import-accounts').addEventListener('click', () => $('#import-file').click());
