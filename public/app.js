@@ -397,8 +397,9 @@ function triggerBadge(trigger) {
 
 /**
  * token 生命周期摘要（卡片与列表共用）。
+ * parts 供明细磁贴拆「主值（时效）/ 副值（续期能力）」，text 仍是旧口径完整句子。
  * @param {object} account
- * @returns {{text:string, tone:'ok'|'warn'|'bad'|'mute'}}
+ * @returns {{text:string, tone:'ok'|'warn'|'bad'|'mute', parts:string[]}}
  */
 function tokenState(account) {
   const expMs = account.tokenExpiresAt ? Date.parse(account.tokenExpiresAt) : NaN;
@@ -425,7 +426,7 @@ function tokenState(account) {
     parts.push('缺 refresh_token');
     if (tone !== 'bad') tone = 'warn';
   }
-  return { text: parts.join(' · '), tone };
+  return { text: parts.join(' · '), tone, parts };
 }
 
 /**
@@ -1328,8 +1329,9 @@ function accountRow(account) {
 
 /**
  * 列表视图的展开明细（行的兄弟节点，紧跟其后）。
- * 方案 A：左右两栏 —— 左侧积分 Hero 面板（与卡片视图共用 creditBlock），
- * 右侧 UID / Token / 上次签到 + 三个操作按钮。展开行本身（.t-row 六列）结构与交互不动。
+ * 方案 B「指标磁贴」：四磁贴（总剩余积分 / 签到状态 / 签到计划 / Token 有效期）
+ * + 双进度卡 + 底栏（UID 芯片 + 测试签到 / 刷新额度 / 导出）。
+ * 加载 / 错误 / 空态沿用 creditBlock（与卡片视图同源）；展开行本身（.t-row 六列）结构与交互不动。
  * @param {object} account
  * @returns {HTMLElement}
  */
@@ -1340,34 +1342,162 @@ function accountDetail(account) {
   wrap.hidden = !open;
 
   const entry = state.credits[account.id];
-  const grid = el('div', 'detail-grid');
+  const data = entry && entry.data;
+  const body = el('div', 'detail-body');
 
-  // 左：积分 Hero 面板（含加载 / 错误 / 空态，与卡片视图完全同源）
-  grid.appendChild(creditBlock(account, entry));
+  if (!data) {
+    // 加载中 / 查询失败 / 尚未查询：整块交给 creditBlock，保持与卡片视图完全同源
+    body.appendChild(creditBlock(account, entry));
+  } else {
+    // ---- 指标磁贴行 ----
+    const tiles = el('div', 'detail-tiles');
 
-  // 右：账号信息 + 操作
-  const side = el('div', 'detail-side');
-  side.appendChild(cardLine('UID', account.uid || '—', 'mono'));
+    // 1) 总剩余积分（大号等宽数字，明细区的核心视觉）
+    const balance = el('span', null, fmtCredits(data.totalLeft));
+    if (data.totalLeft !== null && data.totalLeft !== undefined && Number.isFinite(Number(data.totalLeft))) {
+      balance.appendChild(el('span', 'unit', '分'));
+    }
+    tiles.appendChild(detailTile('总剩余积分', balance, null, { num: true, live: true }));
 
-  const token = tokenState(account);
-  // title 保留旧口径完整句子「Token 有效至 … · 可自动续期」，值本身不再重复前缀
-  const tokenText = `Token ${token.text}`;
-  const tokenLine = cardLine('Token', token.text, tokenValueClass(token.tone));
-  tokenLine.title = tokenText;
-  side.appendChild(tokenLine);
+    // 2) 签到状态（徽标）+ 最近一次签到时间作副值
+    const latest = latestRunFor(account.id);
+    const statusSub = latest && latest.startedAt ? `最近 ${fmtDayTime(latest.startedAt)}` : '今天还没跑过';
+    tiles.appendChild(detailTile('签到状态', statusBadge(account), statusSub));
 
-  const latest = latestRunFor(account.id);
-  side.appendChild(cardLine('上次签到', latest && latest.startedAt ? fmtDayTime(latest.startedAt) : '—'));
+    // 3) 签到计划（北京时间整点下拉，与折叠行同源同交互）
+    tiles.appendChild(detailTile('签到计划', checkinHourPicker(account), null));
 
-  const actions = el('div', 'detail-actions');
-  actions.appendChild(detailAction('测试签到', () => testCheckin(account), 'btn-primary'));
-  actions.appendChild(detailAction('刷新额度', () => loadCredits(account.id)));
-  actions.appendChild(detailAction('导出', () => askExportAccount(account)));
-  side.appendChild(actions);
+    // 4) Token 有效期（主值 = 时效，副值 = 续期能力）
+    const token = tokenState(account);
+    // title 保留旧口径完整句子「Token 有效至 … · 可自动续期」，值本身不重复前缀
+    const tokenText = `Token ${token.text}`;
+    const tokenParts = Array.isArray(token.parts) && token.parts.length > 0 ? token.parts : [token.text];
+    tiles.appendChild(detailTile(
+      'Token 有效期',
+      tokenParts[0],
+      tokenParts.length > 1 ? tokenParts.slice(1).join(' · ') : null,
+      { tone: tokenValueClass(token.tone), title: tokenText },
+    ));
 
-  grid.appendChild(side);
-  wrap.appendChild(grid);
+    body.appendChild(tiles);
+
+    // ---- 双进度卡：条长口径与 creditBarRow 一致（填充 = 剩余额度，越长越充足） ----
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    if (groups.length > 0) {
+      const bars = el('div', 'detail-bars');
+      for (const group of groups) bars.appendChild(creditBarCard(group, bars.childElementCount));
+      body.appendChild(bars);
+    }
+  }
+
+  // ---- 底栏：UID 芯片（常显复制按钮，触屏友好） + 测试签到 / 刷新额度 / 导出 ----
+  const foot = el('div', 'detail-foot');
+  const uidChip = el('span', 'uid-chip');
+  uidChip.appendChild(el('span', 'k', 'UID'));
+  uidChip.appendChild(el('span', 'mono-v', account.uid || '—'));
+  if (account.uid) {
+    const copyBtn = el('button', 'copy');
+    copyBtn.type = 'button';
+    copyBtn.title = '复制 UID';
+    copyBtn.setAttribute('aria-label', `复制账号 ${account.name} 的 UID`);
+    copyBtn.appendChild(copyIcon());
+    copyBtn.addEventListener('click', () => {
+      void copyText(account.uid, 'UID');
+    });
+    uidChip.appendChild(copyBtn);
+  }
+  foot.appendChild(uidChip);
+  foot.appendChild(el('span', 'spacer'));
+  foot.appendChild(detailAction('测试签到', () => testCheckin(account), 'btn-primary'));
+  foot.appendChild(detailAction('刷新额度', () => loadCredits(account.id)));
+  foot.appendChild(detailAction('导出', () => askExportAccount(account)));
+  body.appendChild(foot);
+
+  wrap.appendChild(body);
   return wrap;
+}
+
+/**
+ * 明细磁贴：标签 + 主值 + 可选副值。
+ * @param {string} label
+ * @param {HTMLElement|string} value 主值（元素或文本）
+ * @param {string|null} [sub] 副值文本
+ * @param {{num?:boolean, live?:boolean, tone?:string, title?:string}} [opts]
+ *   num: 主值用等宽数字放大；live: 标签前带实时数据呼吸点；
+ *   tone: 主值语气配色（复用 tokenValueClass 的 good / warn-t / bad）；title: 主值悬浮提示
+ * @returns {HTMLElement}
+ */
+function detailTile(label, value, sub, opts = {}) {
+  const tile = el('div', 'tile');
+  const k = el('span', 'tile-k', label);
+  if (opts.live) k.appendChild(el('span', 'hero-live'));
+  tile.appendChild(k);
+
+  const v = el('div', `tile-v${opts.num ? ' num' : ''}${opts.tone ? ` ${opts.tone}` : ''}`);
+  if (typeof value === 'string') v.appendChild(document.createTextNode(value));
+  else v.appendChild(value);
+  if (opts.title) v.title = opts.title;
+  tile.appendChild(v);
+
+  if (sub) tile.appendChild(el('span', 'tile-sub', sub));
+  return tile;
+}
+
+/**
+ * 明细区的单张进度卡（方案 B 版进度行：名称 + 大号剩余百分比 + 进度条 + 用量说明）。
+ * 条长口径与 creditBarRow 完全一致：填充 = 剩余额度（越长越充足），百分比同源。
+ * @param {object} group
+ * @param {number} index 展示顺序（决定配色档位）
+ * @returns {HTMLElement}
+ */
+function creditBarCard(group, index) {
+  const tone = barToneClass(index);
+  const percent = creditRemainPercent(group);
+
+  const card = el('div', 'pcard');
+  const head = el('div', 'pcard-head');
+  const name = el('span', 'bar-name');
+  name.appendChild(el('span', `sw ${tone}`));
+  name.appendChild(el('span', null, group.label || '积分'));
+  head.appendChild(name);
+  head.appendChild(el('span', `pcard-pct ${tone}`, `剩余 ${percent}%`));
+  card.appendChild(head);
+
+  const track = el('div', 'bar-track');
+  track.setAttribute('role', 'progressbar');
+  track.setAttribute('aria-label', `${group.label || '积分'}剩余额度`);
+  track.setAttribute('aria-valuemin', '0');
+  track.setAttribute('aria-valuemax', '100');
+  track.setAttribute('aria-valuenow', String(percent));
+  const fill = el('span', `bar-fill ${tone}`);
+  fill.style.width = `${percent}%`;
+  track.appendChild(fill);
+  card.appendChild(track);
+
+  const cap = el('div', 'pcard-cap');
+  cap.appendChild(document.createTextNode('已使用 '));
+  cap.appendChild(el('b', null, fmtCredits(group.used)));
+  cap.appendChild(document.createTextNode(`/${fmtCredits(group.total)}`));
+  if (group.expiring) cap.appendChild(el('span', 'credit-expiry', '即将过期'));
+  card.appendChild(cap);
+  return card;
+}
+
+/**
+ * 进度条「剩余百分比」（0~100 整数）：优先后端 remainPercent，缺失时用 (total-used)/total 兜底。
+ * creditBarRow 与 creditBarCard 共用，保证条宽与文案永远一致。
+ * @param {object} group
+ * @returns {number}
+ */
+function creditRemainPercent(group) {
+  const total = Number(group.total);
+  const used = Number(group.used);
+  const reported = Number(group.remainPercent);
+  if (Number.isFinite(reported)) return Math.max(0, Math.min(100, Math.round(reported)));
+  if (Number.isFinite(total) && total > 0 && Number.isFinite(used)) {
+    return Math.max(0, Math.min(100, Math.round(((total - used) / total) * 100)));
+  }
+  return 0;
 }
 
 /**
@@ -1472,16 +1602,8 @@ function creditBlock(account, entry) {
 function creditBarRow(group, index) {
   const row = el('div', 'bar-row');
 
-  const total = Number(group.total);
-  const used = Number(group.used);
-  const reported = Number(group.remainPercent);
-  // 优先用后端算好的 remainPercent；缺失时用 (total - used) / total 兜底。
-  // 条宽与文案都只认这一个 percent，保证两者永远一致。
-  const percent = Number.isFinite(reported)
-    ? Math.max(0, Math.min(100, Math.round(reported)))
-    : (Number.isFinite(total) && total > 0 && Number.isFinite(used)
-      ? Math.max(0, Math.min(100, Math.round(((total - used) / total) * 100)))
-      : 0);
+  // 优先后端 remainPercent，缺失时 (total-used)/total 兜底 —— 与 creditBarCard 共用同一口径
+  const percent = creditRemainPercent(group);
 
   const name = el('span', 'bar-name');
   name.appendChild(el('span', `sw ${barToneClass(index)}`));

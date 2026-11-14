@@ -970,42 +970,201 @@ select:disabled { opacity: .45; cursor: not-allowed; }
 .row-chev:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; border-radius: 4px; }
 .t-row.is-open .row-chev { transform: rotate(90deg); }
 
-/* 展开明细（方案 A）：左 Hero 用量面板（1.35fr） + 右信息列（1fr） */
+/* 展开明细（方案 B）：指标磁贴行 + 双进度卡 + 底栏（UID 芯片 + 操作按钮） */
 .detail {
   border-bottom: 1px solid var(--grid-line);
   background: var(--panel-2);
   padding: 4px 14px 16px;
 }
 
-.detail-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  gap: 14px;
-  align-items: start;
-}
-
-.detail-side {
-  display: grid;
-  gap: 6px;
-  align-content: start;
-  padding: 4px 0;
+.detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   min-width: 0;
 }
 
-.detail-side .acc-line .k { width: 58px; }
-
-.detail-actions {
-  display: flex;
+.detail-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
-  margin-top: 6px;
 }
 
-.detail-actions .btn {
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 11px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.tile-k {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tile-v {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 积分主值：等宽放大 + tabular-nums，明细区的核心视觉 */
+.tile-v.num {
+  font-family: var(--mono);
+  font-size: 17px;
+  letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.tile-v .unit { font-size: 11px; font-weight: 400; color: var(--muted); }
+/* Token 语气配色（复用 tokenValueClass 的类名口径，与 .acc-line .v 一致） */
+.tile-v.good { color: var(--ok); }
+.tile-v.warn-t { color: var(--warn); }
+.tile-v.bad { color: var(--danger); }
+
+/* 磁贴里的签到时间下拉：占满磁贴宽度，和主值同一视觉线 */
+.tile-v .acc-hour-select { width: 100%; max-width: none; height: 26px; }
+
+.tile-sub {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.detail-bars {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pcard {
+  min-width: 0;
+  padding: 9px 11px 11px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.pcard-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pcard-head .bar-name { flex: 1; min-width: 0; }
+
+/* 大号剩余百分比：配色档位与进度条填充同源 */
+.pcard-pct {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.pcard-pct.plan-c { color: var(--primary-text); }
+.pcard-pct.bonus-c { color: var(--info); }
+.pcard-pct.warn-c { color: var(--warn); }
+
+.pcard .bar-track { margin-top: 8px; }
+
+.pcard-cap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pcard-cap b { color: var(--text-2); font-weight: 600; }
+
+.detail-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detail-foot .btn {
   flex: 0 0 auto;
   height: 29px;
   padding: 0 13px;
   font-size: 11.5px;
 }
+
+/* UID 芯片：等宽截断 + 常显复制按钮（触屏没有 hover，不做浮出） */
+.uid-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 46%;
+  padding: 4px 6px 4px 9px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.uid-chip .k { flex: none; font-size: 11px; color: var(--muted); }
+
+.uid-chip .mono-v {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uid-chip .copy {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: background var(--dur), color var(--dur);
+}
+
+.uid-chip .copy:hover { color: var(--text); background: var(--panel-3); }
+.uid-chip .copy:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.uid-chip .copy svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.detail-foot .spacer { flex: 1; min-width: 8px; }
 
 /* ---- 卡片视图 ---- */
 .acc-grid {
@@ -1307,9 +1466,9 @@ html[data-theme="light"] .bar-track { background: rgba(15, 21, 25, .10); }
   font-weight: 600;
 }
 
-/* ---- 方案 A 响应式（账号页专属规则随本分区维护，不动分区 10） ---- */
+/* ---- 方案 B 响应式（账号页专属规则随本分区维护，不动分区 10） ---- */
 @media (max-width: 1100px) {
-  .detail-grid { grid-template-columns: 1fr; }
+  .detail-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 560px) {
@@ -1709,6 +1868,12 @@ html[data-theme="light"] .bar-track { background: rgba(15, 21, 25, .10); }
   .t-body .t-row { grid-template-areas: "acc acc acc acc acc act" "status hour money . . act"; }
   .acc-hour-select { min-width: 70px; max-width: 84px; height: 30px; font-size: 11.5px; }
   .detail { padding: 12px; }
+
+  /* 窄屏明细：进度卡单列；底栏 UID 芯片独占一行，按钮等宽铺满 */
+  .detail-bars { grid-template-columns: 1fr; }
+  .detail-foot { flex-wrap: wrap; }
+  .uid-chip { flex: 1 1 100%; max-width: none; }
+  .detail-foot .btn { flex: 1 1 0; height: 36px; padding: 0 10px; }
 
   .acc-card-foot .btn { height: 42px; font-size: 12px; }
 
