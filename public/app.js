@@ -193,15 +193,12 @@ function setButtonContent(button, iconName, label) {
 }
 
 /**
- * 把时间戳格式化成 HH:MM（本地时区）。
+ * 把时间戳格式化成 HH:MM（Asia/Shanghai）。
  * @param {number} ms
  * @returns {string}
  */
 function formatClock(ms) {
-  const date = new Date(ms);
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  return `${hh}:${mm}`;
+  return CLOCK_FMT.format(new Date(ms));
 }
 
 /** @param {string} iso @returns {string} */

@@ -137,6 +137,36 @@ export function beijingHourText(hour) {
 }
 
 /**
+ * 毫秒时间戳 -> 北京时间的日期时间文本 `YYYY-MM-DD HH:MM`（面向用户展示）。
+ * @param {number} ms
+ * @returns {string}
+ */
+export function beijingDateTimeText(ms) {
+  const t = Number.isFinite(ms) ? ms : 0;
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+      hour12: false,
+    }).formatToParts(new Date(t));
+    const pick = (type) => (parts.find((item) => item.type === type)?.value || '');
+    const year = pick('year');
+    const month = pick('month');
+    const day = pick('day');
+    const rawHour = Number(pick('hour'));
+    const hour = Number.isFinite(rawHour) ? (rawHour === 24 ? 0 : rawHour) : 0;
+    const minute = pick('minute');
+    if (year && month && day) {
+      return `${year}-${month}-${day} ${String(hour).padStart(2, '0')}:${minute || '00'}`;
+    }
+  } catch {
+    // Intl 不可用时走 UTC 兜底
+  }
+  return new Date(t).toISOString().replace('T', ' ').slice(0, 16);
+}
+
+/**
  * 北京时间整点 -> 对应的 UTC 整点文本（跨日只关心钟点，便于面板提示）。
  * 例：北京 08:00 -> UTC 00:00；北京 00:00 -> UTC 16:00（前一日）。
  * @param {number} hour

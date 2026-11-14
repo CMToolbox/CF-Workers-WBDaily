@@ -48,6 +48,39 @@ test('beijingParts：UTC 23:45 对应北京时间次日 07:45', () => {
   assert.equal(hour, 7);
 });
 
+test('beijingParts：跨月边界——UTC 10-31 16:00 已是北京 11-01 00:00', () => {
+  const { date, hour } = beijingParts(utc(2026, 10, 31, 16, 0));
+  assert.equal(date, '2026-11-01');
+  assert.equal(hour, 0);
+});
+
+test('beijingParts：跨年边界——UTC 12-31 16:00 已是北京次年 01-01 00:00', () => {
+  const { date, hour } = beijingParts(utc(2026, 12, 31, 16, 0));
+  assert.equal(date, '2027-01-01');
+  assert.equal(hour, 0);
+});
+
+test('beijingParts：跨年边界——UTC 12-31 15:59 仍是北京 12-31 23:59', () => {
+  const { date, hour } = beijingParts(utc(2026, 12, 31, 15, 59));
+  assert.equal(date, '2026-12-31');
+  assert.equal(hour, 23);
+});
+
+test('beijingParts：UTC 16:00~23:59（北京次日 0 点~8 点）日期归属正确', () => {
+  // UTC 16:00 = 北京 00:00（次日）
+  const t1 = beijingParts(utc(2026, 6, 15, 16, 0));
+  assert.equal(t1.date, '2026-06-16');
+  assert.equal(t1.hour, 0);
+  // UTC 19:00 = 北京 03:00（次日）
+  const t2 = beijingParts(utc(2026, 6, 15, 19, 0));
+  assert.equal(t2.date, '2026-06-16');
+  assert.equal(t2.hour, 3);
+  // UTC 23:45 = 北京 07:45（次日）
+  const t3 = beijingParts(utc(2026, 6, 15, 23, 45));
+  assert.equal(t3.date, '2026-06-16');
+  assert.equal(t3.hour, 7);
+});
+
 test('beijingParts：非法时间戳不抛错（回落 1970）', () => {
   const { date, hour } = beijingParts(NaN);
   assert.equal(typeof date, 'string');

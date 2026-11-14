@@ -144,6 +144,75 @@ test('CapacityType=4 时按当日切片计算总量与剩余', () => {
   assert.equal(result.groups[0].total, 88);
 });
 
+test('computeCredits：无时区后缀的时间字符串按北京时间（UTC+8）解析', () => {
+  // 北京 2026-11-17 00:00:00 = UTC 2026-11-16T16:00:00Z
+  const beijingStr = '2026-11-17 00:00:00';
+  const result = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: beijingStr })],
+  }, NOW);
+  const benefit = result.groups.find((g) => g.key === 'benefit');
+  assert.ok(benefit, 'benefit 分组应存在');
+  assert.equal(
+    benefit.time,
+    '2026-11-16T16:00:00.000Z',
+    '北京时间 11-17 00:00 应解析为 UTC 11-16 16:00（而非 UTC 11-17 00:00）',
+  );
+});
+
+test('computeCredits：T 分隔无时区字符串同样按北京时间解析', () => {
+  const beijingStr = '2026-11-17T00:00:00';
+  const result = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: beijingStr })],
+  }, NOW);
+  const benefit = result.groups.find((g) => g.key === 'benefit');
+  assert.equal(benefit.time, '2026-11-16T16:00:00.000Z');
+});
+
+test('computeCredits：带显式时区的字符串不受影响（Z / +08:00）', () => {
+  // UTC 2026-11-17T00:00:00Z
+  const utcResult = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: '2026-11-17T00:00:00Z' })],
+  }, NOW);
+  const utcGroup = utcResult.groups.find((g) => g.key === 'benefit');
+  assert.equal(utcGroup.time, '2026-11-17T00:00:00.000Z', 'Z 后缀应按 UTC 解析');
+
+  // 北京 2026-11-17T00:00:00+08:00 = UTC 2026-11-16T16:00:00Z
+  const tzResult = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: '2026-11-17T00:00:00+08:00' })],
+  }, NOW);
+  const tzGroup = tzResult.groups.find((g) => g.key === 'benefit');
+  assert.equal(tzGroup.time, '2026-11-16T16:00:00.000Z', '+08:00 后缀应正确解析');
+});
+
+test('computeCredits：纯日期字符串按北京时间当天 0 点解析（不再返回 null）', () => {
+  // "2026-11-20" = 北京 2026-11-20 00:00 = UTC 2026-11-19T16:00:00Z
+  const result = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: '2026-11-20' })],
+  }, NOW);
+  const benefit = result.groups.find((g) => g.key === 'benefit');
+  assert.ok(benefit, 'benefit 分组应存在');
+  assert.equal(
+    benefit.time,
+    '2026-11-19T16:00:00.000Z',
+    '纯日期应解析为北京当天 0 点 = UTC 前一天 16:00',
+  );
+});
+
+test('computeCredits：纯日期字符串不被 3 天窗口误判为已过期', () => {
+  // NOW = 北京 11-14 16:00；"2026-11-20" = 北京 11-20 00:00 → 还有约 5.3 天，不应 expiring
+  const result = computeCredits({
+    summary: null,
+    resources: [pkg(CODE.activity, 100, 70, { DeductionEndTime: '2026-11-20' })],
+  }, NOW);
+  const benefit = result.groups.find((g) => g.key === 'benefit');
+  assert.equal(benefit.expiring, false, '5 天后到期不应标 expiring');
+});
+
 // ============ 上游请求 ============
 
 test('fetchAccountCredits：三次请求并发、头与 body 正确、付费/免费同 ResourceId 去重', async () => {

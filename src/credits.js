@@ -17,6 +17,7 @@
 import { AppError, truncate } from './util.js';
 import { ensureFreshToken, tokenExpiresAtMs } from './upstream-token.js';
 import { bearerOf, buildUpstreamHeaders } from './upstream-headers.js';
+import { beijingDateTimeText, beijingParts } from './schedule.js';
 
 const BASE = 'https://copilot.tencent.com';
 
@@ -164,9 +165,17 @@ function timeMs(value) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   if (!text) return null;
+  // 纯日期字符串（无时间部分）补成当天 00:00:00，否则拼 +08:00 后 Date.parse 会 NaN
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(text);
   // 兼容 "2026-11-14 16:17:00"（Safari 不接受空格分隔，换成 T）
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(text) ? text.replace(' ', 'T') : text;
-  const parsed = Date.parse(normalized);
+  const normalized = dateOnly
+    ? `${text}T00:00:00`
+    : /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(text) ? text.replace(' ', 'T') : text;
+  // 无时区后缀的日期时间字符串按北京时间（UTC+8）解析：上游为中国服务，
+  // CycleEndTime / DeductionEndTime 等时间字段约定使用北京时间；
+  // 带 Z / ±HH:MM 显式时区的字符串由 Date.parse 自行处理。
+  const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized);
+  const parsed = Date.parse(hasTz ? normalized : `${normalized}+08:00`);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -309,23 +318,6 @@ function round2(value) {
 }
 
 // ============ 上游请求 ============
-
-/** 上海时区的 YYYY-MM-DD（免费额度按自然日切片）。 */
-function shanghaiDate(ms) {
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
-    }).formatToParts(new Date(ms));
-    const pick = (type) => (parts.find((item) => item.type === type)?.value || '');
-    const year = pick('year');
-    const month = pick('month');
-    const day = pick('day');
-    if (year && month && day) return `${year}-${month}-${day}`;
-  } catch {
-    // 忽略，走 UTC 兜底
-  }
-  return new Date(ms).toISOString().slice(0, 10);
-}
 
 /**
  * 组装额度接口请求头。
@@ -548,7 +540,7 @@ export async function fetchAccountCredits(ctx, account, options = {}) {
   if (!token) throw new CreditsError('data', '账号缺少 token');
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(100, options.timeoutMs) : TIMEOUT_MS;
   const nowMs = Number.isFinite(options.now) ? options.now : (typeof ctx.now === 'function' ? ctx.now() : Date.now());
-  const date = shanghaiDate(nowMs);
+  const date = beijingParts(nowMs).date;
   const headers = creditHeaders(acc);
   const sleep = resolveSleep(ctx, options);
   const params = { account: acc, headers, date, timeoutMs, nowMs };
@@ -621,7 +613,8 @@ export async function svcAccountCredits(ctx, accountId, options = {}) {
       const nowMs = typeof ctx.now === 'function' ? ctx.now() : 0;
       const expMs = tokenExpiresAtMs(effective.token);
       const expired = expMs !== null && expMs <= nowMs;
-      const expiresText = expMs === null ? '' : new Date(expMs).toISOString().replace('T', ' ').slice(0, 16);
+      // 面向用户的过期文本用北京时间展示（与面板口径一致）
+      const expiresText = expMs === null ? '' : beijingDateTimeText(expMs);
       const hasRefreshToken = typeof effective.refreshToken === 'string' && Boolean(effective.refreshToken);
       const refreshHint = refreshError ? `：${refreshError.message}` : '';
       const message = tokenInvalid
