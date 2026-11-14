@@ -5,6 +5,7 @@
 import { AppError, newRunId, truncate } from './util.js';
 import { createRunLogger, finalizeRun } from './logger.js';
 import { checkinAccount, checkinStatus } from './checkin.js';
+import { withFreshToken } from './upstream-token.js';
 
 /** run 锁 TTL（秒）。 */
 const RUN_LOCK_TTL_SEC = 300;
@@ -136,7 +137,7 @@ export async function runCheckin(ctx, { accountIds = null, trigger = 'manual', d
         continue;
       }
       try {
-        const status = await checkinStatus(ctx, item.account);
+        const status = await withFreshToken(ctx, item.account, (account) => checkinStatus(ctx, account), { persist: false });
         const okStatus = status.result === 'already_checked_in' || status.result === 'not_checked_in';
         outcomes.push({
           accountId: item.account.id,
@@ -236,7 +237,7 @@ export async function runCheckin(ctx, { accountIds = null, trigger = 'manual', d
         continue;
       }
       try {
-        const outcome = await checkinAccount(ctx, item.account);
+        const outcome = await withFreshToken(ctx, item.account, (account) => checkinAccount(ctx, account));
         outcomes.push({
           accountId: item.account.id,
           result: outcome.result,

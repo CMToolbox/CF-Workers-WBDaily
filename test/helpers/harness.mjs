@@ -10,12 +10,24 @@ import { createContext } from '../../src/store.js';
 import { handleApi } from '../../src/api.js';
 import { AppError, fail } from '../../src/util.js';
 
-/** 上游基址与两个端点（响应形状见 PRD §6.1）。 */
+/** 上游基址与端点（响应形状见 PRD §6.1）。 */
 export const UPSTREAM_BASE = 'https://copilot.tencent.com';
 export const STATUS_PATH = '/v2/billing/meter/checkin-status';
 export const DAILY_PATH = '/v2/billing/meter/daily-checkin';
 export const STATUS_URL = `${UPSTREAM_BASE}${STATUS_PATH}`;
 export const DAILY_URL = `${UPSTREAM_BASE}${DAILY_PATH}`;
+
+/** token 续期端点（src/upstream-token.js 使用）。 */
+export const REFRESH_PATH = '/v2/plugin/auth/token/refresh';
+export const REFRESH_URL = `${UPSTREAM_BASE}${REFRESH_PATH}`;
+
+/** 额度查询三个端点（src/credits.js 使用）。 */
+export const SUMMARY_PATH = '/billing/meter/get-user-resource-summary';
+export const PAID_PATH = '/billing/meter/get-user-resource-paid-packages';
+export const FREE_PATH = '/billing/meter/get-user-resource-free-packages';
+
+/** mock 允许的出站端点全集：出现其它路径即视为测试装配错误。 */
+const ALLOWED_PATHS = new Set([STATUS_PATH, DAILY_PATH, REFRESH_PATH, SUMMARY_PATH, PAID_PATH, FREE_PATH]);
 
 /** 站点基址（API 测试用）。 */
 export const SITE_ORIGIN = 'https://wb.example.com';
@@ -96,7 +108,7 @@ export function createUpstreamMock(handler) {
     if (parsed.origin !== UPSTREAM_BASE) {
       throw new Error(`[mock] 出现了未预期的 fetch 目标：${url}`);
     }
-    if (parsed.pathname !== STATUS_PATH && parsed.pathname !== DAILY_PATH) {
+    if (!ALLOWED_PATHS.has(parsed.pathname)) {
       throw new Error(`[mock] 出现了未预期的上游端点：${parsed.pathname}`);
     }
     const headers = init.headers || {};
@@ -107,9 +119,12 @@ export function createUpstreamMock(handler) {
       headers,
       authorization: headers.authorization || headers.Authorization || null,
       contentType: headers['content-type'] || headers['Content-Type'] || null,
+      refreshToken: headers['x-refresh-token'] || headers['X-Refresh-Token'] || null,
+      refreshSource: headers['x-auth-refresh-source'] || headers['X-Auth-Refresh-Source'] || null,
+      domain: headers['x-domain'] || headers['X-Domain'] || null,
       body: init.body,
       signal: init.signal,
-      token: String(headers.authorization || '').replace(/^Bearer\s+/i, ''),
+      token: String(headers.authorization || headers.Authorization || '').replace(/^Bearer\s+/i, ''),
     };
     calls.push(call);
     const response = await handler(call, calls);

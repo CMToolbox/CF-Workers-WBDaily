@@ -1,7 +1,9 @@
 // test/credits.test.mjs
 // 覆盖：积分四分组计算（基础/赠送/奖励/购买）/ 官方 summary 优先取总剩余 /
 //       CapacityType=4 日切片 / 付费与免费资源去重 / 上游请求形状（URL、头、body、日期）/
-//       HTTP 401·业务 code·非 JSON·超时·网络 五类错误 / token 失效映射为 502 而非 401。
+//       HTTP 401·403·业务 code·非 JSON·超时·网络 六类错误 /
+//       401 映射 tokenInvalid（502 而非 401）、403 映射 upstreamBlocked /
+//       非确定性失败重试一次（403/429/5xx/timeout 重试，401 与业务码不重试）/ token 不泄漏。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -164,6 +166,16 @@ test('fetchAccountCredits：三次请求并发、头与 body 正确、付费/免
     assert.equal(call.headers.Authorization, `Bearer ${TOKEN}`);
     assert.equal(call.headers['X-User-Id'], UID);
     assert.equal(call.headers['Content-Type'], 'application/json');
+    // 与 checkin.js 同口径的浏览器特征头：额度接口恰恰是线上被 403 风控的那条链路
+    assert.equal(
+      call.headers['User-Agent'],
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'User-Agent 必须与 checkin.js 的 CLIENT_USER_AGENT 完全一致',
+    );
+    assert.equal(call.headers.Origin, 'https://copilot.tencent.com');
+    assert.equal(call.headers.Referer, 'https://copilot.tencent.com/');
+    assert.equal(call.headers.Accept, 'application/json');
+    assert.equal(call.headers['Accept-Language'], 'zh-CN');
   }
 
   const paidBody = mock.calls.find((call) => call.path === PATHS.paid).body;
@@ -183,21 +195,27 @@ test('fetchAccountCredits：三次请求并发、头与 body 正确、付费/免
   assert.equal(result.groups.find((group) => group.key === 'benefit').left, 70);
 });
 
-test('fetchAccountCredits：HTTP 401 抛 CreditsError(http,401)，不泄漏 token', async () => {
+test('fetchAccountCredits：HTTP 401 抛 CreditsError(http,401)，不重试、不泄漏 token', async () => {
   const mock = mockUpstream({
     summary: () => jsonRes({ code: 401, message: 'unauthorized' }, 401),
     paid: () => jsonRes({}),
     free: () => jsonRes({}),
   });
   const { ctx } = makeCtx({ fetch: mock, clock: () => NOW });
+  const sleeps = [];
 
-  await assert.rejects(fetchAccountCredits(ctx, ACCOUNT), (err) => {
-    assert.ok(err instanceof CreditsError);
-    assert.equal(err.kind, 'http');
-    assert.equal(err.status, 401);
-    assert.ok(!String(err.message).includes(TOKEN));
-    return true;
-  });
+  await assert.rejects(
+    fetchAccountCredits(ctx, ACCOUNT, { sleep: async (ms) => { sleeps.push(ms); } }),
+    (err) => {
+      assert.ok(err instanceof CreditsError);
+      assert.equal(err.kind, 'http');
+      assert.equal(err.status, 401);
+      assert.ok(!String(err.message).includes(TOKEN));
+      return true;
+    },
+  );
+  assert.equal(sleeps.length, 0, '401 是确定性失败，不得重试');
+  assert.equal(mock.calls.filter((call) => call.path === PATHS.summary).length, 1, '401 只允许 1 次尝试');
 });
 
 test('fetchAccountCredits：业务 code≠0 / 非 JSON / 缺 data 分别抛 api、bad_json、data', async () => {
@@ -224,7 +242,8 @@ test('fetchAccountCredits：上游忽略 AbortSignal 也会在 timeoutMs 后返�
 
   const started = Date.now();
   await assert.rejects(
-    fetchAccountCredits(ctx, ACCOUNT, { timeoutMs: 60 }),
+    // 注入 sleep 避免真的等 400ms；timeout 属于可重试类，共 2 次尝试
+    fetchAccountCredits(ctx, ACCOUNT, { timeoutMs: 60, sleep: async () => {} }),
     (err) => err instanceof CreditsError && err.kind === 'timeout',
   );
   assert.ok(Date.now() - started < 1000, '不应依赖上游自觉中断');
@@ -238,6 +257,75 @@ test('fetchAccountCredits：网络错误抛 network', async () => {
     assert.equal(err.kind, 'network');
     return true;
   });
+});
+
+// ============ 重试策略 ============
+
+test('fetchAccountCredits：403 重试一次（共 2 次尝试）后仍失败', async () => {
+  const mock = mockUpstream({
+    summary: () => textRes('<html>403 Forbidden</html>', 403),
+    paid: () => textRes('<html>403 Forbidden</html>', 403),
+    free: () => textRes('<html>403 Forbidden</html>', 403),
+  });
+  const { ctx } = makeCtx({ fetch: mock, clock: () => NOW });
+  const sleeps = [];
+
+  await assert.rejects(
+    fetchAccountCredits(ctx, ACCOUNT, { sleep: async (ms) => { sleeps.push(ms); } }),
+    (err) => err instanceof CreditsError && err.kind === 'http' && err.status === 403,
+  );
+
+  assert.deepEqual(sleeps, [400], '403 属于非确定性失败，必须间隔 400ms 重试一次');
+  assert.equal(mock.calls.filter((call) => call.path === PATHS.summary).length, 2, 'summary 应尝试 2 次');
+  assert.equal(mock.calls.length, 6, '三个端点 × 2 次尝试');
+});
+
+test('fetchAccountCredits：首次 403、重试 200 → 整体成功（验证重试生效）', async () => {
+  let summaryCalls = 0;
+  const mock = mockUpstream({
+    summary: () => {
+      summaryCalls += 1;
+      return summaryCalls === 1
+        ? textRes('<html>403 Forbidden</html>', 403)
+        : jsonRes({ code: 0, data: { Packages: [{ CycleRemainCapacity: '400' }] } });
+    },
+    paid: () => jsonRes({ code: 0, data: { Accounts: [pkg(CODE.proMon, 500, 400)], TotalCount: 1 } }),
+    free: () => jsonRes({ code: 0, data: { Accounts: [], TotalCount: 0 } }),
+  });
+  const { ctx } = makeCtx({ fetch: mock, clock: () => NOW });
+  let slept = 0;
+
+  const result = await fetchAccountCredits(ctx, ACCOUNT, {
+    sleep: async () => { slept += 1; },
+  });
+
+  assert.equal(result.totalLeft, 400);
+  assert.equal(result.groups[0].left, 400);
+  assert.equal(summaryCalls, 2);
+  assert.equal(slept, 1, '只在两次尝试之间等待一次');
+});
+
+test('CreditsError.message 带响应体片段（去换行、≤120 字符），且必然剔除 token', async () => {
+  const mock = mockUpstream({
+    // 故意让上游把请求头回显到 body 里，验证 message 不会泄漏 token
+    summary: ({ headers }) => textRes(`<html>\n<title>403 Forbidden</title>\n${headers.Authorization}\n</html>`, 403),
+    paid: () => jsonRes({}),
+    free: () => jsonRes({}),
+  });
+  const { ctx } = makeCtx({ fetch: mock, clock: () => NOW });
+
+  await assert.rejects(
+    fetchAccountCredits(ctx, ACCOUNT, { sleep: async () => {} }),
+    (err) => {
+      assert.ok(err instanceof CreditsError);
+      assert.equal(err.kind, 'http');
+      assert.match(err.message, /403 Forbidden/, '片段要能看出是拦截页');
+      assert.equal(err.message.includes('\n'), false, '片段必须去掉换行');
+      assert.equal(err.message.includes(TOKEN), false, 'message 绝不包含 token');
+      assert.ok(err.message.length < 200, `message 过长：${err.message.length}`);
+      return true;
+    },
+  );
 });
 
 // ============ 服务层 ============
@@ -265,4 +353,31 @@ test('svcAccountCredits：账号不存在抛 404；token 失效映射为 502 + d
     return true;
   });
   assert.equal(ctx.writes(), 1, '额度查询只允许 putAccounts 这一次写，业务查询零写');
+});
+
+test('svcAccountCredits：403 不判 tokenInvalid，而是 upstreamBlocked（出口风控，会重试 1 次）', async () => {
+  const mock = mockUpstream({
+    summary: () => textRes('<html>403 Forbidden</html>', 403),
+    paid: () => textRes('<html>403 Forbidden</html>', 403),
+    free: () => textRes('<html>403 Forbidden</html>', 403),
+  });
+  const { ctx } = makeCtx({ fetch: mock, clock: () => NOW });
+  await ctx.kv.putAccounts([ACCOUNT]);
+
+  await assert.rejects(
+    svcAccountCredits(ctx, 'acc_1', { sleep: async () => {} }),
+    (err) => {
+      assert.ok(err instanceof AppError);
+      assert.equal(err.code, 'UPSTREAM_ERROR', 'HTTP 语义仍是 502，不能返回 401/403 给前端');
+      assert.equal(err.detail.tokenInvalid !== true, true, '403 绝不能标记 tokenInvalid');
+      assert.equal(err.detail.upstreamBlocked, true);
+      assert.equal(err.detail.status, 403);
+      assert.match(err.message, /拒绝访问/);
+      assert.match(err.message, /HTTP 403/);
+      assert.equal(String(err.message).includes(TOKEN), false);
+      return true;
+    },
+  );
+  // 403 属于非确定性失败 → 重试一次
+  assert.equal(mock.calls.filter((call) => call.path === PATHS.summary).length, 2, '403 必须重试 1 次');
 });

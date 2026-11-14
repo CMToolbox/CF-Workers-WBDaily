@@ -76,13 +76,14 @@ SETUP_TOKEN=dev-token
 npm test
 ```
 
-等价于 `node --test test/*.test.mjs`。它会跑 `test/` 下的全部用例（7 个测试文件）：用内存 KV + mock 上游覆盖签到 / 鉴权 / 接口 / MCP / 额度 / 导入导出全链路，**不会真的去签到**，也不会碰你线上的 KV。
+等价于 `node --test test/*.test.mjs`。它会跑 `test/` 下的全部用例：用内存 KV + mock 上游覆盖签到 / 鉴权 / 接口 / MCP / 额度 / 导入导出全链路，**不会真的去签到**，也不会碰你线上的 KV。
 
 > 请用 `npm test`（或上面的完整命令），不要用 `node --test test`。后者在 Node 22 上会按目录解析成模块路径并报 `MODULE_NOT_FOUND`。
 
 ## 使用说明
 
 1. **录入账号**：面板「新增账号」→ 填名称 + 粘贴 WorkBuddy token（可选 UID / 备注）。最多 10 个账号。
+   **`refresh_token` 强烈建议一起填**：`access_token` 是短期凭据（官方登录 `expires_in=3600`，实际以 JWT 的 `exp` 为准），而且**会被上游轮换**——在 cockpit-tools 里刷新一次，之前导出的 access_token 就可能失效。只填 access_token 迟早 401；填了 refresh_token 后程序会在到期前自动续期并回写 KV。
 2. **看额度**：账号卡片会自动查询积分配额，显示用量状态、总剩余积分、套餐基础积分、平台奖励积分与切换时间；点「刷新额度」可单独重查。额度接口需要 UID，**建议填写 UID**，否则可能查不到数据。
 3. **测试签到**：某行右侧「测试签到」立刻跑一次，结果会以徽标形式出现在该账号行上（最近一次结果）。
 4. **立即全部签到**：只跑「启用」的账号；执行期间按钮禁用，完成后弹「成功 x / 共 y」。
@@ -180,7 +181,10 @@ curl -sS https://cf-workers-wbdaily.<你的子域>.workers.dev/api/mcp \
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 账号显示「失败 / Token 已失效（HTTP 401）」 | 上游 token 过期。重新从 WorkBuddy 网页端复制 token，编辑账号粘贴保存（留空不会改动 token） |
+| 账号显示「失败 / Token 已失效（HTTP 401）」 | **先看卡片上的 token 状态徽标**。`access_token` 是短期凭据且会被上游轮换：<br>① 显示「可自动续期」→ 程序会在到期前自动换新，持续 401 说明 refresh_token 也失效了，重新导入账号 JSON；<br>② 显示「缺 refresh_token」→ 该账号导入时没带 refresh_token（旧版本面板会在上传前裁掉它），请用当前版本从 cockpit-tools 重新导出并导入一次；<br>③ 显示「Token 有效期未知」→ 上游 token 不是标准 JWT，程序只能靠 401 兜底续期 |
+| 卡片提示「…未保存 refresh_token，无法自动续期」 | 导入来源缺少 refresh_token（旧版本前端上传时会裁掉它）。cockpit-tools 的 `workbuddy_accounts_*.json` 里带 `refreshToken` 字段，用当前版本重新导入即可；手工新增则把 refresh_token 一起粘进对话框 |
+| 卡片提示「上游拒绝访问（HTTP 403）：可能是出口 IP 被风控或触发限流」 | **不是 token 问题**（token 有效也会被这条链路拦下）。这是 Worker 出口 IP 被上游边缘（EdgeOne/APISIX）风控或限流；可先稍后重试（代码已对 403/429/5xx/超时自动重试 1 次）。持续失败请用自建中转：`wrangler secret put UPSTREAM_BASE_URL`（签到）、`CREDITS_BASE_URL`（额度）、`REFRESH_BASE_URL`（token 续期），值填你自己中转的 `https://...` 基址 |
+| 测试签到提示「今天已签到，请明天再来」/ run 明细里 `code=10001` | 当日重复签到属于幂等成功：现在按 `already_checked_in` 处理，不再记成「失败」。上游返回的是 HTTP 400 + 业务码 10001，代码优先按业务码判定 |
 | 登录或设置密码时报 `1102` / 页面 500 | 单请求 CPU 超限。确认 `wrangler.toml` 里 `PBKDF2_ITERATIONS = "30000"`，不要调到 10 万 |
 | 页面 404 / 打开是空白 | 检查 `wrangler.toml` 的 `[assets] directory = "./public"`、`binding = "ASSETS"`、`not_found_handling = "none"`；`public/` 下必须有 `index.html`、`app.js`、`styles.css` |
 | 部署报 `KV namespace ... not found` | `[[kv_namespaces]]` 的 `id` 还是占位值，替换成 `wrangler kv namespace create WB_KV` 的输出 |

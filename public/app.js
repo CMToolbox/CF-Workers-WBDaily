@@ -133,6 +133,51 @@ function setButtonContent(button, iconName, label) {
   button.appendChild(document.createTextNode(label));
 }
 
+/**
+ * 把时间戳格式化成 HH:MM（本地时区）。
+ * @param {number} ms
+ * @returns {string}
+ */
+function formatClock(ms) {
+  const date = new Date(ms);
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+/**
+ * token 生命周期行。
+ *
+ * WorkBuddy 的 access_token 只有 3600 秒有效期，光看一个打码的 token 完全判断不出
+ * 「为什么昨天还能用今天就不行」。这里把两件事直接摆出来：
+ *   1. 现在还剩多久（已过期 / N 分钟后过期 / 有效至 HH:MM）；
+ *   2. 过期后能不能自己续（有没有保存 refresh_token）。
+ * @param {object} account
+ * @returns {HTMLElement}
+ */
+function tokenStateRow(account) {
+  const row = el('div', 'acc-token-state');
+  const expMs = account.tokenExpiresAt ? Date.parse(account.tokenExpiresAt) : NaN;
+  if (Number.isFinite(expMs)) {
+    const leftMs = expMs - Date.now();
+    if (leftMs <= 0) {
+      row.appendChild(el('span', 'badge badge-bad', 'Token 已过期'));
+    } else if (leftMs <= 10 * 60 * 1000) {
+      row.appendChild(el('span', 'badge badge-warn', `Token ${Math.max(1, Math.ceil(leftMs / 60000))} 分钟后过期`));
+    } else {
+      row.appendChild(el('span', 'badge badge-mute', `Token 有效至 ${formatClock(expMs)}`));
+    }
+  } else {
+    row.appendChild(el('span', 'badge badge-mute', 'Token 有效期未知'));
+  }
+  if (account.hasRefreshToken) {
+    row.appendChild(el('span', 'badge badge-ok', '可自动续期'));
+  } else {
+    row.appendChild(el('span', 'badge badge-warn', '缺 refresh_token'));
+  }
+  return row;
+}
+
 /** @param {string} iso @returns {string} */
 function fmtTime(iso) {
   const date = new Date(iso);
@@ -456,6 +501,7 @@ function accountCard(account) {
   meta.appendChild(el('span', `acc-uid${account.uid ? '' : ' is-empty'}`, account.uid ? `UID ${account.uid}` : 'UID —'));
   meta.appendChild(resultBadge(latestResultFor(account.id)));
   card.appendChild(meta);
+  card.appendChild(tokenStateRow(account));
 
   // ---- 积分配额 ----
   card.appendChild(creditBlock(account, entry));
@@ -518,9 +564,18 @@ function creditBlock(account, entry) {
 
   if (entry.error) {
     const error = el('div', 'credit-error');
-    error.appendChild(el('span', null, entry.error.tokenInvalid
-      ? 'Token 已失效，请更新账号 token 后重试'
+    // 只有「确实 401」才归到 token 问题；403/429/超时等环境问题直接显示后端 message，
+    // 否则会把出口风控误报成 token 失效（用户改 token 也修不好）。
+    // token 失效时优先用后端 message：它已经区分了「已过期 / 缺 refresh_token / 续期失败」。
+    error.appendChild(el('span', null, entry.error.tokenInvalid === true
+      ? (entry.error.message || 'Token 已失效，请更新账号 token 后重试')
       : (entry.error.message || '额度查询失败')));
+    if (entry.error.tokenInvalid === true) {
+      const fix = el('button', 'btn btn-ghost btn-sm', '更新 Token');
+      fix.type = 'button';
+      fix.addEventListener('click', () => openAccountDialog(account));
+      error.appendChild(fix);
+    }
     const retry = el('button', 'btn btn-ghost btn-sm', '重试');
     retry.type = 'button';
     retry.addEventListener('click', () => loadCredits(account.id));
@@ -1198,6 +1253,10 @@ function openAccountDialog(account) {
   $('#acc-name').value = account ? account.name : '';
   $('#acc-token').value = '';
   $('#acc-token').placeholder = account ? `留空则不修改（当前 ${account.tokenMasked}）` : '粘贴 WorkBuddy token';
+  $('#acc-refresh-token').value = '';
+  $('#acc-refresh-token').placeholder = account && account.hasRefreshToken
+    ? '留空则不修改（已保存）'
+    : '粘贴 refresh_token（否则 token 失效后只能手动重导）';
   $('#acc-uid').value = account ? account.uid || '' : '';
   $('#acc-remark').value = account ? account.remark || '' : '';
   $('#acc-enabled').checked = account ? account.enabled === true : true;
@@ -1249,6 +1308,10 @@ async function saveAccount() {
     body.token = token;
   }
 
+  // refresh_token 与 token 同语义：留空 = 不修改（编辑时只想换 access_token 不会被清空）
+  const refreshToken = $('#acc-refresh-token').value.trim();
+  if (refreshToken) body.refreshToken = refreshToken;
+
   const isCreate = editingAccountId === null;
   $('#btn-acc-save').disabled = true;
   try {
@@ -1297,18 +1360,25 @@ function askDeleteAccount(account) {
 /**
  * 上传前裁掉 cockpit-tools 的大字段（quota_raw/usage_raw 等），只保留导入所需字段。
  * 既减少请求体积，也避免把整份账号快照送到服务端。
+ *
+ * 注意 refresh_token 必须保留：它被裁掉等于「token 一失效就只能手动重导」。
+ * cockpit-tools 导出用驼峰 refreshToken，这里统一落成 refresh_token 再上传。
  * @param {*} payload
  * @returns {*}
  */
 function compactImportPayload(payload) {
   const pick = (item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
-    return {
+    const picked = {
       access_token: item.access_token ?? item.accessToken ?? item.token,
       uid: item.uid,
       nickname: item.nickname,
       email: item.email,
     };
+    const refresh = item.refresh_token ?? item.refreshToken;
+    if (typeof refresh === 'string' && refresh) picked.refresh_token = refresh;
+    if (typeof item.domain === 'string' && item.domain) picked.domain = item.domain;
+    return picked;
   };
   if (Array.isArray(payload)) return payload.map(pick);
   if (payload && Array.isArray(payload.accounts)) return { accounts: payload.accounts.map(pick) };
@@ -1352,6 +1422,11 @@ async function onImportFile(event) {
       setError('BAD_REQUEST', data.reasons.join('；'));
     }
     await refreshAccounts();
+    // 没有 refresh_token 的账号迟早掉线，导入完就提醒，别等到签到失败才发现
+    const noRefresh = state.accounts.filter((account) => account.hasRefreshToken !== true);
+    if (noRefresh.length > 0) {
+      setError('BAD_REQUEST', `${noRefresh.length} 个账号未包含 refresh_token：access_token 会过期或被上游轮换，失效后需手动重新导入`);
+    }
     void loadAllCredits({ silent: true });
   } catch (err) {
     if (!(err instanceof ApiError) || err.status !== 401) {

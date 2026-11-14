@@ -29,6 +29,7 @@ import { runCheckin } from './run.js';
 import { checkinStatus } from './checkin.js';
 import { svcAccountCredits } from './credits.js';
 import { buildCockpitExport, mergeImportedAccounts, normalizeImportPayload } from './account-io.js';
+import { withFreshToken, tokenExpiresAtMs } from './upstream-token.js';
 
 /** 服务版本号（bootstrap 与 MCP serverInfo 保持一致）。 */
 export const VERSION = '1.0.0';
@@ -150,20 +151,27 @@ function asString(value) {
 
 /**
  * 账号出参脱敏：只给 tokenMasked，**绝不**返回 token 字段。
+ * 额外给两个「token 生命周期」字段，让面板能直接显示「还有多久过期 / 能不能自动续期」：
+ *   - tokenExpiresAt：从 JWT exp 解出的过期时刻（解不出为 null）
+ *   - hasRefreshToken：是否保存了 refresh_token（决定过期后能否自动续期）
  * @param {object} account
  * @returns {object}
  */
 function maskAccount(account) {
   const src = account && typeof account === 'object' ? account : {};
+  const token = typeof src.token === 'string' ? src.token : '';
+  const expMs = tokenExpiresAtMs(token);
   return {
     id: typeof src.id === 'string' ? src.id : '',
     name: typeof src.name === 'string' ? src.name : '',
-    tokenMasked: maskToken(typeof src.token === 'string' ? src.token : ''),
+    tokenMasked: maskToken(token),
     uid: typeof src.uid === 'string' ? src.uid : '',
     enabled: src.enabled === true,
     remark: typeof src.remark === 'string' ? src.remark : '',
     createdAt: typeof src.createdAt === 'string' ? src.createdAt : '',
     updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+    tokenExpiresAt: expMs === null ? null : isoNow(expMs),
+    hasRefreshToken: typeof src.refreshToken === 'string' && Boolean(src.refreshToken),
   };
 }
 
@@ -214,6 +222,7 @@ export async function svcCreateAccount(ctx, input) {
   }
   const token = sanitizeToken(src.token);
   if (!token) throw new AppError('BAD_REQUEST', 'Token 不能为空');
+  const refreshToken = sanitizeToken(src.refreshToken);
   const uid = asString(src.uid);
   if (uid.length > UID_MAX_LENGTH) {
     throw new AppError('BAD_REQUEST', `UID 不能超过 ${UID_MAX_LENGTH} 个字符`);
@@ -237,6 +246,8 @@ export async function svcCreateAccount(ctx, input) {
     createdAt: nowIso,
     updatedAt: nowIso,
   };
+  // 有 refresh_token 才能扛过 access_token 的短期有效期，缺失时不写该字段（保持记录干净）
+  if (refreshToken) account.refreshToken = refreshToken;
   const next = [...accounts, account];
   await ctx.kv.putAccounts(next);
   return maskAccount(account);
@@ -272,6 +283,13 @@ export async function svcUpdateAccount(ctx, id, input) {
     const token = sanitizeToken(src.token);
     if (!token) throw new AppError('BAD_REQUEST', 'Token 不能为空');
     next.token = token;
+    // token 换了，旧的过期时间作废（下次访问会按新 JWT 重新计算）
+    delete next.expiresAt;
+  }
+  // refresh_token 与 token 同语义：留空 = 不修改，便于用户只换 access_token
+  if (src.refreshToken !== undefined && asString(src.refreshToken) !== '') {
+    const refreshToken = sanitizeToken(src.refreshToken);
+    if (refreshToken) next.refreshToken = refreshToken;
   }
   if (src.uid !== undefined) {
     const uid = asString(src.uid);
@@ -404,7 +422,8 @@ export async function svcCheckinStatus(ctx, accountId) {
   if (targetId && targets.length === 0) throw new AppError('NOT_FOUND', '账号不存在');
   const out = [];
   for (const account of targets) {
-    const status = await checkinStatus(ctx, account);
+    // access_token 只有 3600 秒有效期：先按 exp 续期，401 再兜底续期一次
+    const status = await withFreshToken(ctx, account, (effective) => checkinStatus(ctx, effective));
     out.push({
       accountId: account.id,
       accountName: typeof account.name === 'string' ? account.name : '',
@@ -671,6 +690,7 @@ async function handleExportAccounts({ ctx, url }) {
  * GET /api/accounts/:id/credits（auth）：实时查询积分配额。
  * 只读上游、零 KV 写；token 失效用 502 + detail.tokenInvalid 表达，
  * 不能用 401（否则前端会误判会话过期并退出登录）。
+ * 上游 403（出口 IP 被风控/限流）用 detail.upstreamBlocked 表达，不标记 tokenInvalid。
  * @param {{ctx:object, params:object}} params
  * @returns {Promise<Response>}
  */

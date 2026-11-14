@@ -212,6 +212,11 @@
       <span id="acc-token-hint" class="hint">编辑时留空表示不修改。token 会明文存放在 KV 中。</span>
     </label>
     <label class="field">
+      <span class="label">refresh_token <span class="muted">（可选，强烈建议填）</span></span>
+      <input id="acc-refresh-token" class="input" type="text" placeholder="粘贴 refresh_token" aria-label="refresh_token">
+      <span id="acc-refresh-hint" class="hint">access_token 是短期凭据、且会被上游轮换（实际有效期看 JWT exp）。填了 refresh_token 才能自动续期，否则失效后只能手动重导。</span>
+    </label>
+    <label class="field">
       <span class="label">UID <span class="muted">（可选）</span></span>
       <input id="acc-uid" class="input" type="text" maxlength="64" placeholder="上游用户 ID" aria-label="UID">
     </label>

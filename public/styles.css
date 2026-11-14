@@ -290,6 +290,9 @@ code { background: rgba(255, 255, 255, .06); padding: 1px 5px; border-radius: 6p
 
 .acc-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
+/* token 生命周期：剩余有效期 + 是否保存了 refresh_token（决定能否自动续期） */
+.acc-token-state { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
 /* 底部操作区：窄卡片时允许换行，按钮可收缩（卡片内新增「导出」按钮后共 3 个） */
 .acc-card-foot { display: flex; align-items: center; gap: 8px; margin-top: 2px; flex-wrap: wrap; }
 .acc-card-foot .btn { min-width: 0; }
