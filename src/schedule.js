@@ -28,9 +28,6 @@ export const DEFAULT_CHECKIN_HOUR = 8;
 /** 自动分配签到小时的起点（新账号从 8 点开始往后找空位）。 */
 const HOUR_SEARCH_START = 8;
 
-/** cron 轮询间隔（分钟），与 wrangler.toml 的每 15 分钟轮询保持一致。 */
-export const CRON_INTERVAL_MINUTES = 15;
-
 /**
  * 把毫秒时间戳换算成北京时间的日期与小时。
  *

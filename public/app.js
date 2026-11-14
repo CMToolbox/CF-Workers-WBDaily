@@ -15,7 +15,6 @@ const ICONS = Object.freeze({
   trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>',
   upload: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/></svg>',
   download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>',
-  clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>',
 });
 
 /** Asia/Shanghai 时间格式（月/日 时:分）。 */
@@ -73,7 +72,6 @@ const state = {
   loading: { accounts: false, logs: false },
   me: null,
   setupTokenRequired: false,
-  version: '1.0.0',
 };
 
 /** 业务错误的统一载体。 */
@@ -357,7 +355,6 @@ function toast(message, kind = 'info') {
 function renderAll() {
   renderError();
   renderAuthError();
-  renderTop();
   renderAccounts();
   renderLogs();
   renderSettings();
@@ -391,16 +388,6 @@ function renderAuthError() {
   } else {
     loginError.hidden = true;
   }
-}
-
-function renderTop() {
-  const node = $('#top-writes');
-  const value = state.settings && Number.isFinite(state.settings.kvWritesToday) ? state.settings.kvWritesToday : 0;
-  node.textContent = `≈ ${value}/1000`;
-  node.classList.toggle('is-high', value > 800);
-  node.title = value > 800
-    ? '今日 KV 写入接近免费额度（1000/天），请减少手动签到次数'
-    : '今日 KV 写入次数（近似值，免费额度 1000/天）';
 }
 
 /** @param {string} accountId @returns {string} */
@@ -853,7 +840,6 @@ function renderSettings() {
   if (settings) {
     $('#retention-input').value = String(settings.retentionRuns);
   }
-  $('#settings-version').textContent = state.version || '1.0.0';
 
   const prefixNode = $('#mcp-prefix');
   if (state.mcpKey && state.mcpKey.exists) {
@@ -875,7 +861,6 @@ function syncBusy() {
 
   $('#btn-refresh').disabled = state.busy.run;
   $('#btn-add-account').disabled = state.busy.run;
-  $('#btn-spread-hours').disabled = state.busy.run || state.busy.hour === 'spread';
   $('#btn-save-retention').disabled = state.busy.retention;
   $('#btn-gen-mcp').disabled = state.busy.key;
   $('#btn-change-pw').disabled = state.busy.pw;
@@ -952,7 +937,6 @@ async function boot() {
   try {
     const data = await api('/api/bootstrap', { allow401: true });
     state.setupTokenRequired = Boolean(data && data.setupTokenRequired);
-    state.version = (data && data.version) || '1.0.0';
     $('#setup-token-wrap').hidden = !state.setupTokenRequired;
 
     if (!data || !data.initialized) {
@@ -1033,7 +1017,6 @@ async function refreshQuiet() {
     return;
   }
   if (!failure) clearError();
-  renderTop();
   renderLogs();
   renderSettings();
   renderAccounts();
@@ -1134,7 +1117,6 @@ async function refreshLogs() {
     state.settings = settings || null;
     renderLogs();
     renderSettings();
-    renderTop();
     renderAccounts();
   } catch (err) {
     if (!(err instanceof ApiError) || err.status !== 401) setError(err.code || 'INTERNAL', err.message);
@@ -1647,7 +1629,6 @@ async function saveRetention() {
   syncBusy();
   try {
     state.settings = await api('/api/settings', { method: 'PUT', body: { retentionRuns: raw } });
-    renderTop();
     renderSettings();
     hint.hidden = false;
     const evicted = Number(state.settings && state.settings.evicted) || 0;
@@ -1661,48 +1642,6 @@ async function saveRetention() {
   }
 }
 
-/**
- * 一键错开：把「启用」账号的签到时间按当前顺序排成 08:00、09:00、10:00…
- *
- * 解决的是存量账号问题：旧版本没有 checkinHour 字段，全部回落到 8 点，反而扎堆。
- * 只有时间确实不同的账号才发请求，避免无意义的整表写。
- */
-async function spreadCheckinHours() {
-  const targets = state.accounts.filter((account) => account.enabled === true);
-  if (targets.length === 0) {
-    toast('没有启用的账号', 'warn');
-    return;
-  }
-  const plan = targets.map((account, index) => ({
-    account,
-    hour: (8 + index) % 24,
-  })).filter((item) => item.account.checkinHour !== item.hour);
-  if (plan.length === 0) {
-    toast('签到时间已经是错开的，无需调整', 'ok');
-    return;
-  }
-
-  state.busy.hour = 'spread';
-  syncBusy();
-  try {
-    // 串行执行：每个账号一次 PUT，后端每次整表写一遍 KV，串行不会互相覆盖
-    for (const item of plan) {
-      await api(`/api/accounts/${encodeURIComponent(item.account.id)}`, {
-        method: 'PUT',
-        body: { checkinHour: item.hour },
-      });
-    }
-    toast(`已为 ${plan.length} 个账号错开签到时间（08:00 起依次顺延）`, 'ok');
-  } catch (err) {
-    if (!(err instanceof ApiError) || err.status !== 401) {
-      setError(err.code || 'INTERNAL', err.message || '错开签到时间失败');
-    }
-  } finally {
-    state.busy.hour = null;
-    syncBusy();
-    await refreshAccounts();
-  }
-}
 
 /**
  * 生成/重置 MCP Key。
@@ -1848,7 +1787,6 @@ function bindEvents() {
     toast('已刷新', 'info');
   });
   $('#btn-run-all').addEventListener('click', runAll);
-  $('#btn-spread-hours').addEventListener('click', spreadCheckinHours);
   $('#btn-add-account').addEventListener('click', () => openAccountDialog(null));
   $('#btn-import-accounts').addEventListener('click', () => $('#import-file').click());
   $('#import-file').addEventListener('change', onImportFile);

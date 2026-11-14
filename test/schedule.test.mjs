@@ -12,7 +12,6 @@ import {
   accountsDueAt,
   beijingHourText,
   beijingParts,
-  CRON_INTERVAL_MINUTES,
   DEFAULT_CHECKIN_HOUR,
   isDayComplete,
   isDoneResult,
@@ -147,10 +146,6 @@ test('accountsDueAt：脏数据不炸（null / 无 id / 字符串小时）', () 
 
 test('accountsDueAt：非数组输入返回空数组', () => {
   assert.deepEqual(accountsDueAt(null, utc(2026, 11, 14, 0, 0)), []);
-});
-
-test('CRON_INTERVAL_MINUTES 与部署表达式一致', () => {
-  assert.equal(CRON_INTERVAL_MINUTES, 15);
 });
 
 // ============ 待签账号 ============

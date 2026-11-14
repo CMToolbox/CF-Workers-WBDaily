@@ -538,10 +538,8 @@ test('PUT /api/settings：4 → 400、5 → 200、101 → 400', async () => {
   const ok5 = await dispatch(ctx, '/api/settings', { method: 'PUT', cookie, body: { retentionRuns: 5 } });
   assert.equal(ok5.status, 200);
   assert.equal(ok5.body.data.retentionRuns, 5);
-  // 签到时间已改为每账号属性，settings 里只剩日志保留条数与固定的轮询间隔
-  assert.equal(ok5.body.data.cronIntervalMinutes, 15);
+  // 签到时间已改为每账号属性，settings 里只剩日志保留条数
   assert.equal('checkinHour' in ok5.body.data, false, '全局签到时间必须已移除');
-  assert.equal(typeof ok5.body.data.kvWritesToday, 'number');
 });
 
 test('GET /api/settings 与轮询接口零 KV 写（AC-14 的接口侧证据）', async () => {
@@ -697,49 +695,6 @@ test('写接口必须 application/json：非 JSON content-type 返回 400', asyn
   assertErrorEnvelope(brokenJson, 'BAD_REQUEST');
 });
 
-// ===== F1 回归：kvWritesToday 必须计入非 run 写入，且 env 间不串味 =====
-
-test('F1 回归：setup + 建号后 kvWritesToday ≥ 2，另一个 env 的计数不受影响', async () => {
-  // env A：setup(1 写) + 建号(1 写) = 2 次真实写
-  const envA = { WB_KV: createMemoryKv() };
-  const cookieA = await workerLogin(envA);
-  const created = await workerCall(envA, '/api/accounts', {
-    method: 'POST',
-    cookie: cookieA,
-    body: { name: '主账号', token: 'abcdefghijkl' },
-  });
-  assert.equal(created.status, 200);
-
-  const settingsA = await workerCall(envA, '/api/settings', { cookie: cookieA });
-  assert.equal(settingsA.status, 200);
-  assert.ok(
-    settingsA.body.data.kvWritesToday >= 2,
-    `同一 env 下 setup+建号（真实 2 次写）后 kvWritesToday 至少为 2，实际 ${settingsA.body.data.kvWritesToday}`,
-  );
-
-  // env B：只做了 setup（1 写），不得把 env A 的计数带过来（防模块级变量串味）
-  const envB = { WB_KV: createMemoryKv() };
-  const cookieB = await workerLogin(envB);
-  const settingsB = await workerCall(envB, '/api/settings', { cookie: cookieB });
-
-  assert.ok(
-    settingsB.body.data.kvWritesToday <= 1,
-    `env B 只写了 1 次（setup），计数不得受 env A 影响，实际 ${settingsB.body.data.kvWritesToday}`,
-  );
-  assert.ok(
-    settingsB.body.data.kvWritesToday < settingsA.body.data.kvWritesToday,
-    `两个 env 的计数必须独立：A=${settingsA.body.data.kvWritesToday} B=${settingsB.body.data.kvWritesToday}`,
-  );
-
-  // 同一 env 的累计以自增为准：再建一个号后必须严格变大
-  await workerCall(envA, '/api/accounts', { method: 'POST', cookie: cookieA, body: { name: '第二个', token: 'mnopqrstuvwx' } });
-  const settingsA2 = await workerCall(envA, '/api/settings', { cookie: cookieA });
-  assert.ok(
-    settingsA2.body.data.kvWritesToday > settingsA.body.data.kvWritesToday,
-    '新增一次写入后 kvWritesToday 必须变大',
-  );
-});
-
 // ===== F3 回归：调低 retentionRuns 时立即淘汰，后续 run 写入 ≤5 =====
 
 test('F3 回归：PUT retentionRuns 后立即淘汰到 5 条，随后 run 写入 ≤5', async () => {
@@ -788,9 +743,7 @@ test('F3 补充：GET /api/settings 形状不变（不泄漏 PUT 独有的 evict
   const { ctx, cookie } = await createAuthedEnv();
 
   const got = await dispatch(ctx, '/api/settings', { cookie });
-  assert.deepEqual(Object.keys(got.body.data).sort(), [
-    'cronIntervalMinutes', 'kvWritesToday', 'retentionRuns',
-  ]);
+  assert.deepEqual(Object.keys(got.body.data).sort(), ['retentionRuns']);
   assert.equal('evicted' in got.body.data, false);
   assert.equal('evictFailed' in got.body.data, false);
 });
@@ -821,38 +774,6 @@ test('F3 补充：淘汰删除失败时 PUT 仍 200，evictFailed=true 且索引
   assert.equal(put.body.data.retentionRuns, 5);
   assert.equal(base.json('log:index').length, 8, '明细删除失败时索引必须保持原样，绝不能出现「索引指向已删明细」');
   assert.equal(base.keys().filter((key) => key.startsWith('log:run:')).length, 8, '明细仍在，与索引一致');
-});
-
-// ===== F1 补充：kvWritesToday 不得把 run 写入算两遍 =====
-
-test('F1 补充：kvWritesToday 不超过真实写次数（不双计 run 写入）', async () => {
-  const kv = createMemoryKv();
-  // 用 env 作为 isolate 状态复用键：worker.fetch 与本地 ctx 共享同一个写计数器
-  const env = { WB_KV: kv };
-  const ctx = createContext(env, { kv, fetch: okUpstream() });
-
-  assert.equal((await setupSystem(ctx)).status, 200);
-  const { cookie } = await loginSystem(ctx);
-  kv.seed('accounts', [makeAccount(1)]);
-
-  const run = await dispatch(ctx, '/api/checkin/run', { method: 'POST', cookie, body: {} });
-  assert.equal(run.body.data.summary.kvWriteCount, 4);
-
-  const realWrites = kv.writeCount();
-  // setup 1 + run 4 + 当日签到进度 checkin:day 1
-  assert.equal(realWrites, 6, '真实写：setup 1 + run 4 + 进度 1');
-
-  const settings = await dispatch(ctx, '/api/settings', { cookie });
-  const reported = settings.body.data.kvWritesToday;
-
-  assert.ok(
-    reported <= realWrites,
-    `kvWritesToday 不得超过真实写次数（否则 run 被算了两次）：reported=${reported} 真实=${realWrites}`,
-  );
-  assert.ok(
-    reported >= run.body.data.summary.kvWriteCount,
-    `至少应覆盖当日 run 的写入：reported=${reported}`,
-  );
 });
 
 // ===== F4 回归：run 期间调低 retentionRuns 不得「复活」已淘汰条目（确定性时序，不用随机 sleep）=====

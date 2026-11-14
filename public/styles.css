@@ -120,18 +120,6 @@ code { background: rgba(255, 255, 255, .06); padding: 1px 5px; border-radius: 6p
 
 .panel-head-right { display: flex; align-items: center; gap: 8px; }
 
-.writes {
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--muted);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 5px 11px;
-  white-space: nowrap;
-}
-
-.writes.is-high { color: var(--bad); border-color: rgba(248, 113, 113, .45); background: rgba(248, 113, 113, .08); }
-
 /* ---------- 按钮 ---------- */
 .btn {
   appearance: none;
@@ -646,7 +634,6 @@ select.input option { background: #0b1220; color: var(--text); }
   .panel-head { align-items: flex-start; }
   /* 品牌独占一行，右侧三项成组靠右 */
   .panel-head-right { width: 100%; justify-content: flex-end; }
-  .writes { white-space: nowrap; }
 
   .card-head { align-items: flex-start; }
   .card-head-actions { width: 100%; }

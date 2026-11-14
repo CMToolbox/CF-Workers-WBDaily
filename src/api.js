@@ -31,7 +31,7 @@ import { svcAccountCredits } from './credits.js';
 import { buildCockpitExport, mergeImportedAccounts, normalizeImportPayload } from './account-io.js';
 import { withFreshToken, tokenExpiresAtMs } from './upstream-token.js';
 import { recordProgress } from './progress.js';
-import { CRON_INTERVAL_MINUTES, normalizeCheckinHour, parseCheckinHour, pickNextCheckinHour } from './schedule.js';
+import { normalizeCheckinHour, parseCheckinHour, pickNextCheckinHour } from './schedule.js';
 
 /** 服务版本号（bootstrap 与 MCP serverInfo 保持一致）。 */
 export const VERSION = '1.0.0';
@@ -177,16 +177,6 @@ function maskAccount(account) {
     // 每账号独立的签到小时（北京时间 0~23），缺失时回落默认 8 点
     checkinHour: normalizeCheckinHour(src.checkinHour),
   };
-}
-
-/**
- * 判断某毫秒时间戳是否落在 UTC 当日。
- * @param {string} iso ISO8601 字符串
- * @param {string} today `YYYY-MM-DD`
- * @returns {boolean}
- */
-function isSameUtcDay(iso, today) {
-  return typeof iso === 'string' && iso.slice(0, 10) === today;
 }
 
 // ===== 服务层（api 与 mcp 共用，全部只经 ctx.kv.* 访问 KV）=====
@@ -401,32 +391,16 @@ export async function svcClearLogs(ctx) {
 }
 
 /**
- * 设置视图：settings + kvWritesToday。
- * kvWritesToday 取 **两个下界的较大值**（近似口径，字段名与 PRD 一致）：
- * - indexBaseline：索引里当日各 run 的 kvWriteCount 之和（覆盖跨 isolate 的历史）；
- * - ctx.writes()：本 isolate 累计写次数（覆盖 setup / 建号 / 设置 / MCP Key 等非 run 写入）。
- * 二者都低估真实总量、且互有覆盖关系，取 max 既不会把同一次 run 算两遍，
- * 也不会像纯 isolate 增量那样在 isolate 重启后归零。
- * 签到时间不在设置里：每个账号各有一个 `checkinHour`（北京时间整点），见 GET /api/accounts。
+ * 设置视图。目前只有日志保留条数：
+ * - 签到时间是**每账号**属性（`accounts[].checkinHour`，北京时间整点）；
+ * - cron 轮询间隔是部署常量（见 wrangler.toml），不随设置变化。
  * @param {object} ctx
- * @returns {Promise<{retentionRuns:number, cronIntervalMinutes:number, kvWritesToday:number}>}
+ * @returns {Promise<{retentionRuns:number}>}
  */
 export async function svcSettings(ctx) {
-  const [settings, index] = await Promise.all([ctx.kv.getSettings(), ctx.kv.getLogIndex()]);
-  const today = isoNow(ctx.now()).slice(0, 10);
-  let baseline = 0;
-  for (const item of index) {
-    if (!item || typeof item !== 'object') continue;
-    if (isSameUtcDay(item.startedAt, today)) {
-      baseline += Number.isFinite(item.kvWriteCount) ? item.kvWriteCount : 0;
-    }
-  }
+  const settings = await ctx.kv.getSettings();
   return {
     retentionRuns: Number.isFinite(settings.retentionRuns) ? settings.retentionRuns : 30,
-    // 部署的 cron 固定每 15 分钟轮询（见 wrangler.toml），不随任何设置变化
-    cronIntervalMinutes: CRON_INTERVAL_MINUTES,
-    // 近似下界：不能简单相加，否则同一次 run 会被 indexBaseline 与本 isolate 计数各算一遍
-    kvWritesToday: Math.max(baseline, ctx.writes()),
   };
 }
 
