@@ -29,6 +29,9 @@ import { runCheckin } from './run.js';
 import { checkinStatus } from './checkin.js';
 import { svcAccountCredits } from './credits.js';
 import { buildCockpitExport, mergeImportedAccounts, normalizeImportPayload } from './account-io.js';
+import { withFreshToken, tokenExpiresAtMs } from './upstream-token.js';
+import { recordProgress } from './progress.js';
+import { normalizeCheckinHour, parseCheckinHour, pickNextCheckinHour } from './schedule.js';
 
 /** 服务版本号（bootstrap 与 MCP serverInfo 保持一致）。 */
 export const VERSION = '1.0.0';
@@ -150,31 +153,30 @@ function asString(value) {
 
 /**
  * 账号出参脱敏：只给 tokenMasked，**绝不**返回 token 字段。
+ * 额外给两个「token 生命周期」字段，让面板能直接显示「还有多久过期 / 能不能自动续期」：
+ *   - tokenExpiresAt：从 JWT exp 解出的过期时刻（解不出为 null）
+ *   - hasRefreshToken：是否保存了 refresh_token（决定过期后能否自动续期）
  * @param {object} account
  * @returns {object}
  */
 function maskAccount(account) {
   const src = account && typeof account === 'object' ? account : {};
+  const token = typeof src.token === 'string' ? src.token : '';
+  const expMs = tokenExpiresAtMs(token);
   return {
     id: typeof src.id === 'string' ? src.id : '',
     name: typeof src.name === 'string' ? src.name : '',
-    tokenMasked: maskToken(typeof src.token === 'string' ? src.token : ''),
+    tokenMasked: maskToken(token),
     uid: typeof src.uid === 'string' ? src.uid : '',
     enabled: src.enabled === true,
     remark: typeof src.remark === 'string' ? src.remark : '',
     createdAt: typeof src.createdAt === 'string' ? src.createdAt : '',
     updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+    tokenExpiresAt: expMs === null ? null : isoNow(expMs),
+    hasRefreshToken: typeof src.refreshToken === 'string' && Boolean(src.refreshToken),
+    // 每账号独立的签到小时（北京时间 0~23），缺失时回落默认 8 点
+    checkinHour: normalizeCheckinHour(src.checkinHour),
   };
-}
-
-/**
- * 判断某毫秒时间戳是否落在 UTC 当日。
- * @param {string} iso ISO8601 字符串
- * @param {string} today `YYYY-MM-DD`
- * @returns {boolean}
- */
-function isSameUtcDay(iso, today) {
-  return typeof iso === 'string' && iso.slice(0, 10) === today;
 }
 
 // ===== 服务层（api 与 mcp 共用，全部只经 ctx.kv.* 访问 KV）=====
@@ -214,6 +216,7 @@ export async function svcCreateAccount(ctx, input) {
   }
   const token = sanitizeToken(src.token);
   if (!token) throw new AppError('BAD_REQUEST', 'Token 不能为空');
+  const refreshToken = sanitizeToken(src.refreshToken);
   const uid = asString(src.uid);
   if (uid.length > UID_MAX_LENGTH) {
     throw new AppError('BAD_REQUEST', `UID 不能超过 ${UID_MAX_LENGTH} 个字符`);
@@ -221,6 +224,14 @@ export async function svcCreateAccount(ctx, input) {
   const remark = asString(src.remark);
   if (remark.length > REMARK_MAX_LENGTH) {
     throw new AppError('BAD_REQUEST', `备注不能超过 ${REMARK_MAX_LENGTH} 个字符`);
+  }
+  // 签到小时：显式传了就必须合法；没传则自动挑一个没被占用的整点，避免新账号全部压在 8 点
+  let checkinHour = null;
+  if (src.checkinHour !== undefined && src.checkinHour !== null && src.checkinHour !== '') {
+    checkinHour = parseCheckinHour(src.checkinHour);
+    if (checkinHour === null) {
+      throw new AppError('BAD_REQUEST', 'checkinHour 必须是 0~23 的整数（北京时间整点）');
+    }
   }
   const accounts = await ctx.kv.getAccounts();
   if (accounts.length >= MAX_ACCOUNTS) {
@@ -234,9 +245,12 @@ export async function svcCreateAccount(ctx, input) {
     uid,
     enabled: src.enabled === undefined ? true : src.enabled === true,
     remark,
+    checkinHour: pickNextCheckinHour(accounts, checkinHour),
     createdAt: nowIso,
     updatedAt: nowIso,
   };
+  // 有 refresh_token 才能扛过 access_token 的短期有效期，缺失时不写该字段（保持记录干净）
+  if (refreshToken) account.refreshToken = refreshToken;
   const next = [...accounts, account];
   await ctx.kv.putAccounts(next);
   return maskAccount(account);
@@ -272,6 +286,13 @@ export async function svcUpdateAccount(ctx, id, input) {
     const token = sanitizeToken(src.token);
     if (!token) throw new AppError('BAD_REQUEST', 'Token 不能为空');
     next.token = token;
+    // token 换了，旧的过期时间作废（下次访问会按新 JWT 重新计算）
+    delete next.expiresAt;
+  }
+  // refresh_token 与 token 同语义：留空 = 不修改，便于用户只换 access_token
+  if (src.refreshToken !== undefined && asString(src.refreshToken) !== '') {
+    const refreshToken = sanitizeToken(src.refreshToken);
+    if (refreshToken) next.refreshToken = refreshToken;
   }
   if (src.uid !== undefined) {
     const uid = asString(src.uid);
@@ -289,6 +310,14 @@ export async function svcUpdateAccount(ctx, id, input) {
   }
   if (src.enabled !== undefined) {
     next.enabled = src.enabled === true;
+  }
+  // 签到小时（北京时间整点）：传了才改，非法直接 400，避免静默回落造成"改了没生效"
+  if (src.checkinHour !== undefined && src.checkinHour !== null && src.checkinHour !== '') {
+    const hour = parseCheckinHour(src.checkinHour);
+    if (hour === null) {
+      throw new AppError('BAD_REQUEST', 'checkinHour 必须是 0~23 的整数（北京时间整点）');
+    }
+    next.checkinHour = hour;
   }
   next.updatedAt = isoNow(ctx.now());
 
@@ -362,31 +391,16 @@ export async function svcClearLogs(ctx) {
 }
 
 /**
- * 设置视图：settings + kvWritesToday。
- * kvWritesToday 取 **两个下界的较大值**（近似口径，字段名与 PRD 一致）：
- * - indexBaseline：索引里当日各 run 的 kvWriteCount 之和（覆盖跨 isolate 的历史）；
- * - ctx.writes()：本 isolate 累计写次数（覆盖 setup / 建号 / 设置 / MCP Key 等非 run 写入）。
- * 二者都低估真实总量、且互有覆盖关系，取 max 既不会把同一次 run 算两遍，
- * 也不会像纯 isolate 增量那样在 isolate 重启后归零。
+ * 设置视图。目前只有日志保留条数：
+ * - 签到时间是**每账号**属性（`accounts[].checkinHour`，北京时间整点）；
+ * - cron 轮询间隔是部署常量（见 wrangler.toml），不随设置变化。
  * @param {object} ctx
- * @returns {Promise<{retentionRuns:number, cronUtc:string, cronLocal:string, kvWritesToday:number}>}
+ * @returns {Promise<{retentionRuns:number}>}
  */
 export async function svcSettings(ctx) {
-  const [settings, index] = await Promise.all([ctx.kv.getSettings(), ctx.kv.getLogIndex()]);
-  const today = isoNow(ctx.now()).slice(0, 10);
-  let baseline = 0;
-  for (const item of index) {
-    if (!item || typeof item !== 'object') continue;
-    if (isSameUtcDay(item.startedAt, today)) {
-      baseline += Number.isFinite(item.kvWriteCount) ? item.kvWriteCount : 0;
-    }
-  }
+  const settings = await ctx.kv.getSettings();
   return {
     retentionRuns: Number.isFinite(settings.retentionRuns) ? settings.retentionRuns : 30,
-    cronUtc: typeof settings.cronUtc === 'string' ? settings.cronUtc : '0 1 * * *',
-    cronLocal: typeof settings.cronLocal === 'string' ? settings.cronLocal : '09:00',
-    // 近似下界：不能简单相加，否则同一次 run 会被 indexBaseline 与本 isolate 计数各算一遍
-    kvWritesToday: Math.max(baseline, ctx.writes()),
   };
 }
 
@@ -404,7 +418,8 @@ export async function svcCheckinStatus(ctx, accountId) {
   if (targetId && targets.length === 0) throw new AppError('NOT_FOUND', '账号不存在');
   const out = [];
   for (const account of targets) {
-    const status = await checkinStatus(ctx, account);
+    // access_token 只有 3600 秒有效期：先按 exp 续期，401 再兜底续期一次
+    const status = await withFreshToken(ctx, account, (effective) => checkinStatus(ctx, effective));
     out.push({
       accountId: account.id,
       accountName: typeof account.name === 'string' ? account.name : '',
@@ -607,6 +622,8 @@ async function handleAccountCheckin({ ctx, params }) {
     // 日志已落盘（诊断优先，已批准的偏差），HTTP 语义仍用 502
     throw new AppError('UPSTREAM_ERROR', entry.message);
   }
+  // 手动签到也写当日进度：否则 cron 到点还会对同一账号再打一遍上游
+  await recordProgress(ctx, result.entries);
   return ok({ ...entry, runId: result.runId });
 }
 
@@ -671,6 +688,7 @@ async function handleExportAccounts({ ctx, url }) {
  * GET /api/accounts/:id/credits（auth）：实时查询积分配额。
  * 只读上游、零 KV 写；token 失效用 502 + detail.tokenInvalid 表达，
  * 不能用 401（否则前端会误判会话过期并退出登录）。
+ * 上游 403（出口 IP 被风控/限流）用 detail.upstreamBlocked 表达，不标记 tokenInvalid。
  * @param {{ctx:object, params:object}} params
  * @returns {Promise<Response>}
  */
@@ -697,6 +715,8 @@ async function handleRunCheckin({ ctx, body }) {
     accountIds = rawIds.length > 0 ? rawIds : null;
   }
   const result = await runCheckin(ctx, { accountIds, trigger: 'manual' });
+  // 手动签到也写当日进度，避免 cron 在同一小时里重复签
+  await recordProgress(ctx, result.entries);
   return ok({ runId: result.runId, summary: result.summary, flushError: result.flushError });
 }
 
@@ -774,7 +794,8 @@ async function evictExcessLogs(ctx, retentionRuns) {
 }
 
 /**
- * PUT /api/settings（auth）
+ * PUT /api/settings（auth）：目前只有日志保留条数。
+ * 签到时间是**每账号**属性，走 PUT /api/accounts/:id 的 checkinHour 字段。
  * @param {{ctx:object, body:object}} params
  * @returns {Promise<Response>}
  */

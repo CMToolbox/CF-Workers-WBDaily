@@ -8,6 +8,13 @@ import { createContext } from './store.js';
 import { runCheckin } from './run.js';
 import { handleApi } from './api.js';
 import { handleMcp } from './mcp.js';
+import {
+  accountsDueAt,
+  beijingParts,
+  isDayComplete,
+  pendingAccountIds,
+} from './schedule.js';
+import { recordProgress } from './progress.js';
 
 /**
  * 结构化日志（单行 JSON，便于 `wrangler tail` 过滤）。
@@ -108,8 +115,16 @@ export default {
   },
 
   /**
-   * Cron 入口：调用 runCheckin(trigger: 'cron')。
-   * 锁被占用时 runCheckin 抛 CONFLICT，此处捕获后只打日志并正常返回（零 KV 写）。
+   * Cron 入口：每 15 分钟轮询一次，按**每个账号自己的签到小时**挑出这一轮该跑的账号。
+   *
+   * 没有全局签到时间：账号 A 可以设 08:00、账号 B 设 09:00，避免同一分钟集中打上游。
+   * 为什么用轮询而不是「每个账号一条精确 cron」：Cloudflare cron 不保证准点，
+   * 单点触发一旦错过就整天不签。改成每小时 4 次轮询后，某个账号的目标小时内
+   * :00/:15/:30/:45 都算窗口，第一次成功即写 KV 标记，后面 3 轮零写短路；
+   * 第一次失败则后 3 轮自动成为重试机会。
+   *
+   * 写入预算：绝大多数触发只读 1 次 accounts 就返回（零写、零上游）；
+   * 到点且已完成时读 2 次返回；真正跑一次 run 才产生 run 的 4+N 次写 + 1 次进度写。
    * @param {{cron?:string, scheduledTime?:number}} controller
    * @param {object} env
    * @param {object} [executionCtx]
@@ -117,25 +132,59 @@ export default {
    */
   async scheduled(controller, env, executionCtx) {
     const cron = controller && typeof controller.cron === 'string' ? controller.cron : null;
+    let ctx = null;
     try {
-      const ctx = createContext(env);
+      ctx = createContext(env);
+      // 用 scheduledTime 判定「这一轮属于哪个小时」：即使实例冷启动延迟到 08:03 才执行，
+      // 仍然按 08:00 这轮归属判断，不会因为跨点而漏签。
+      // scheduledTime 是 UTC 毫秒，beijingParts 负责换算成北京日期/小时。
       const scheduledTime = controller && Number.isFinite(controller.scheduledTime)
         ? controller.scheduledTime
         : ctx.now();
+      const { date, hour } = beijingParts(scheduledTime);
+
+      const accounts = await ctx.kv.getAccounts();
+      // 只有「已启用 + 自己的签到小时 == 当前北京小时」的账号才进这一轮
+      const due = accountsDueAt(accounts, scheduledTime);
+
       logEvent('info', 'cron_tick', {
         ts: isoNow(ctx.now()),
         cron,
         scheduledTime: isoNow(scheduledTime),
+        beijingDate: date,
+        beijingHour: hour,
+        totalAccounts: accounts.length,
+        dueAccounts: due.length,
       });
-      const result = await runCheckin(ctx, { trigger: 'cron' });
+
+      if (due.length === 0) return;
+
+      const day = await ctx.kv.getCheckinDay();
+      if (isDayComplete(due, day, date)) {
+        // 这些账号本小时已签到成功：后 3 轮到这里就结束，不再打上游
+        logEvent('info', 'cron_already_done', { date, hour, accounts: due.length });
+        return;
+      }
+
+      const pending = pendingAccountIds(due, day, date);
+      const result = await runCheckin(ctx, { trigger: 'cron', accountIds: pending });
+
+      // 只把成功结果写进当日进度：失败不写，后续几轮才会重试。
+      // 日期用上面由 scheduledTime 推导的 date，保证与 isDayComplete 是同一天口径。
+      const recorded = await recordProgress(ctx, result.entries, date);
+
       logEvent('info', 'cron_run_finished', {
         runId: result.runId,
+        date,
+        hour,
+        pending: pending.length,
         total: result.summary ? result.summary.total : 0,
         success: result.summary ? result.summary.success : 0,
         failed: result.summary ? result.summary.failed : 0,
         skipped: result.summary ? result.summary.skipped : 0,
         durationMs: result.summary ? result.summary.durationMs : 0,
         kvWriteCount: result.summary ? result.summary.kvWriteCount : 0,
+        progressWritten: Boolean(recorded),
         flushError: result.flushError ? result.flushError.message : null,
       });
     } catch (err) {

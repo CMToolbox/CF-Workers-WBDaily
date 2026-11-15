@@ -7,6 +7,7 @@
 import { AppError, sanitizeToken, sha256Hex, safeEqual } from './util.js';
 import { jsonResponse } from './router.js';
 import { runCheckin } from './run.js';
+import { recordProgress } from './progress.js';
 import {
   VERSION,
   svcCheckinStatus,
@@ -199,6 +200,8 @@ async function callTool(ctx, name, args) {
         trigger: 'manual',
         dryRun: input.dryRun === true,
       });
+      // dryRun 不产生签到副作用，也就不该写当日进度
+      if (input.dryRun !== true) await recordProgress(ctx, result.entries);
       return toolOk({
         runId: result.runId,
         dryRun: input.dryRun === true,

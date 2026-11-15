@@ -14,13 +14,14 @@ export const KV_KEYS = Object.freeze({
   accounts: 'accounts',
   logIndex: 'log:index',
   runLock: 'lock:run',
+  // 当日签到进度（北京时间日期），用于 cron 高频轮询时的幂等短路
+  checkinDay: 'checkin:day',
 });
 
 /** settings 默认值（getSettings 会与存储值做浅合并）。 */
 export const DEFAULT_SETTINGS = Object.freeze({
+  // 签到时间不在这里：每个账号各有自己的 checkinHour，见 schedule.js
   retentionRuns: 30,
-  cronUtc: '0 1 * * *',
-  cronLocal: '09:00',
 });
 
 /** P0 账号上限（同时保护单键值体积）。 */
@@ -181,6 +182,22 @@ export function createStore({ kv, now, counter } = {}) {
     return list;
   }
 
+  /**
+   * 取当日签到进度（不存在/坏值返回 null）。
+   * 结构：`{ date, accounts: { [accountId]: { result, at } }, updatedAt }`
+   */
+  async function getCheckinDay() {
+    const value = await readJson(KV_KEYS.checkinDay);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  }
+
+  /** 覆盖写当日签到进度，返回写入的内存对象。 */
+  async function putCheckinDay(record) {
+    if (!record || typeof record !== 'object') throw new AppError('BAD_REQUEST', 'checkinDay 记录必须为对象');
+    await writeJson(KV_KEYS.checkinDay, record);
+    return record;
+  }
+
   /** 取 MCP Key 记录（不存在返回 null）。 */
   async function getMcp() {
     const value = await readJson(KV_KEYS.mcp);
@@ -306,6 +323,8 @@ export function createStore({ kv, now, counter } = {}) {
     putSettings,
     getAccounts,
     putAccounts,
+    getCheckinDay,
+    putCheckinDay,
     getMcp,
     putMcp,
     getLogIndex,

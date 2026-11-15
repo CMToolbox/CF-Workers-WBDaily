@@ -11,6 +11,7 @@
 // 安全：导入结果只返回计数；导出含明文 token，仅允许已登录管理员调用，且不写日志。
 
 import { AppError, newAccountId, sanitizeToken, sha256Hex, truncate } from './util.js';
+import { parseCheckinHour, pickNextCheckinHour } from './schedule.js';
 
 const NAME_MAX = 32;
 const UID_MAX = 64;
@@ -45,9 +46,13 @@ export function extractImportItems(payload) {
 
 /**
  * 归一化单条记录（cockpit-tools / 本系统字段都接受）。
+ *
+ * refresh_token 必须一并保留：WorkBuddy 的 access_token 只有 3600 秒有效期，
+ * 丢了 refresh_token 就等于「token 一失效就只能手动重导」。
+ * 字段名同时兼容下划线与驼峰（cockpit-tools 导出用驼峰 refreshToken）。
  * @param {*} raw
  * @param {number} index 0-based
- * @returns {{ok:true, item:{name:string, token:string, uid:string}}|{ok:false, reason:string}}
+ * @returns {{ok:true, item:{name:string, token:string, refreshToken:string, uid:string, domain:string}}|{ok:false, reason:string}}
  */
 export function normalizeImportItem(raw, index = 0) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -63,14 +68,41 @@ export function normalizeImportItem(raw, index = 0) {
     return { ok: false, reason: `第 ${index + 1} 条 access_token 过长` };
   }
 
+  // refresh_token 可选：缺失时仍允许导入（只是 token 失效后需重新导入）
+  const refreshRaw = raw.refresh_token ?? raw.refreshToken;
+  const refreshToken = typeof refreshRaw === 'string' ? sanitizeToken(refreshRaw) : '';
+  if (refreshToken.length > TOKEN_MAX_LENGTH) {
+    return { ok: false, reason: `第 ${index + 1} 条 refresh_token 过长` };
+  }
+
   const uidRaw = raw.uid;
   const uid = typeof uidRaw === 'string' ? uidRaw.trim().slice(0, UID_MAX) : '';
+
+  const domainRaw = raw.domain;
+  const domain = typeof domainRaw === 'string' ? domainRaw.trim().slice(0, UID_MAX) : '';
+
+  // 企业 ID：上游部分接口要求 X-Enterprise-Id / X-Tenant-Id，与 uid 一起决定租户上下文
+  const enterpriseRaw = raw.enterprise_id ?? raw.enterpriseId;
+  const enterpriseId = typeof enterpriseRaw === 'string' ? enterpriseRaw.trim().slice(0, UID_MAX) : '';
+
+  // 每账号签到小时（北京时间整点）：cockpit 导出里没有这个字段，本系统导出时带上便于备份恢复
+  const checkinHourRaw = raw.checkin_hour ?? raw.checkinHour;
+  const checkinHour = parseCheckinHour(checkinHourRaw);
+  if (checkinHourRaw !== undefined && checkinHourRaw !== null && checkinHourRaw !== '' && checkinHour === null) {
+    return { ok: false, reason: `第 ${index + 1} 条 checkin_hour 必须是 0~23 的整数` };
+  }
 
   const nick = typeof raw.nickname === 'string' ? raw.nickname.trim() : '';
   const email = typeof raw.email === 'string' ? raw.email.trim() : '';
   const name = truncate(nick || email || `导入账号 ${index + 1}`, NAME_MAX);
 
-  return { ok: true, item: { name, token, uid } };
+  // 只回传真实存在的可选字段，避免空串污染下游判定（也保持既有出参形状不变）
+  const item = { name, token, uid };
+  if (refreshToken) item.refreshToken = refreshToken;
+  if (domain) item.domain = domain;
+  if (enterpriseId) item.enterpriseId = enterpriseId;
+  if (checkinHour !== null) item.checkinHour = checkinHour;
+  return { ok: true, item };
 }
 
 /**
@@ -116,10 +148,24 @@ export function mergeImportedAccounts(existing, incoming, options) {
       let changed = false;
       if (matched.token !== item.token) {
         matched.token = item.token;
+        // token 换了，旧的过期时间立刻作废（refreshToken 可能没换，仍需重算）
+        delete matched.expiresAt;
+        changed = true;
+      }
+      if (item.refreshToken && matched.refreshToken !== item.refreshToken) {
+        matched.refreshToken = item.refreshToken;
         changed = true;
       }
       if (!matched.uid && item.uid) {
         matched.uid = item.uid;
+        changed = true;
+      }
+      if (!matched.domain && item.domain) {
+        matched.domain = item.domain;
+        changed = true;
+      }
+      if (!matched.enterpriseId && item.enterpriseId) {
+        matched.enterpriseId = item.enterpriseId;
         changed = true;
       }
       if (!matched.name && item.name) {
@@ -138,16 +184,22 @@ export function mergeImportedAccounts(existing, incoming, options) {
     if (accounts.length >= options.maxAccounts) {
       throw new AppError('CONFLICT', `导入后将超过 ${options.maxAccounts} 个账号上限，请先清理账号`);
     }
-    accounts.push({
+    const fresh = {
       id: newAccountId(),
       name: item.name,
       token: item.token,
       uid: item.uid,
       enabled: true,
       remark: '',
+      // 没带时间就自动挑一个空位；批量导入 10 个账号会落到 8、9、10… 点，不会扎堆
+      checkinHour: pickNextCheckinHour(accounts, item.checkinHour),
       createdAt: nowIso,
       updatedAt: nowIso,
-    });
+    };
+    if (item.refreshToken) fresh.refreshToken = item.refreshToken;
+    if (item.domain) fresh.domain = item.domain;
+    if (item.enterpriseId) fresh.enterpriseId = item.enterpriseId;
+    accounts.push(fresh);
     imported += 1;
   }
 
@@ -182,7 +234,15 @@ export async function buildCockpitExport(accounts, nowMs) {
       created_at: createdSec,
       last_used: usedSec,
     };
+    // refresh_token 必须回传：它是 access_token 失效后还能自动续期的唯一凭据。
+    // cockpit-tools 的导入解析同时接受 refresh_token / refreshToken（见其 workbuddy_account.rs）。
+    if (typeof account.refreshToken === 'string' && account.refreshToken) {
+      row.refresh_token = account.refreshToken;
+    }
     if (account.uid) row.uid = account.uid;
+    if (account.domain) row.domain = account.domain;
+    if (account.enterpriseId) row.enterprise_id = account.enterpriseId;
+    if (Number.isInteger(account.checkinHour)) row.checkin_hour = account.checkinHour;
     if (account.name) row.nickname = account.name;
     result.push(row);
   }
