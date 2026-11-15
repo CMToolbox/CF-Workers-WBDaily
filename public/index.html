@@ -349,28 +349,51 @@
 <dialog id="dlg-account" class="dlg">
   <form method="dialog" class="dlg-body" autocomplete="off">
     <h2 id="dlg-account-title">新增账号</h2>
-    <label class="field">
-      <span class="label">名称</span>
-      <input id="acc-name" class="input" type="text" maxlength="32" placeholder="例如：主账号" aria-label="账号名称">
-    </label>
-    <label class="field">
-      <span class="label">Token</span>
-      <input id="acc-token" class="input input-mono" type="text" placeholder="粘贴 WorkBuddy token" aria-label="Token">
-      <span id="acc-token-hint" class="hint">编辑时留空表示不修改。token 会明文存放在 KV 中。</span>
-    </label>
-    <label class="field">
-      <span class="label">refresh_token <span class="muted">（可选，强烈建议填）</span></span>
-      <input id="acc-refresh-token" class="input input-mono" type="text" placeholder="粘贴 refresh_token" aria-label="refresh_token">
-      <span id="acc-refresh-hint" class="hint">access_token 是短期凭据、且会被上游轮换（实际有效期看 JWT exp）。填了 refresh_token 才能自动续期，否则失效后只能手动重导。</span>
-    </label>
-    <label class="field">
-      <span class="label">UID <span class="muted">（可选）</span></span>
-      <input id="acc-uid" class="input" type="text" maxlength="64" placeholder="上游用户 ID" aria-label="UID">
-    </label>
-    <label class="field">
-      <span class="label">备注 <span class="muted">（可选）</span></span>
-      <input id="acc-remark" class="input" type="text" maxlength="200" placeholder="备注" aria-label="备注">
-    </label>
+
+    <!-- 录入方式切换：新增时默认「OAuth 授权」；编辑已有账号时隐藏（编辑只能走 Token 录入） -->
+    <div id="acc-mode-switch" class="seg-inline seg-block" role="tablist" aria-label="账号录入方式">
+      <button id="acc-mode-oauth" class="btn is-on" type="button" role="tab" aria-selected="true" aria-pressed="true" aria-controls="acc-oauth-panel" data-acc-mode="oauth">OAuth 授权</button>
+      <button id="acc-mode-token" class="btn" type="button" role="tab" aria-selected="false" aria-pressed="false" aria-controls="acc-token-panel" data-acc-mode="token">Token 录入</button>
+    </div>
+
+    <!-- ---- OAuth 授权面板 ---- -->
+    <section id="acc-oauth-panel" class="stack-tight" role="tabpanel" aria-labelledby="acc-mode-oauth">
+      <p class="hint">点击「授权登录」→ 在打开的官方页面完成登录（不会回跳本页），本页面会自动检测授权结果，成功后账号直接加入列表。</p>
+      <div class="inline">
+        <input id="acc-oauth-url" class="input input-mono input-sm" type="text" readonly placeholder="授权链接会显示在这里" aria-label="授权链接">
+        <button id="btn-acc-oauth-copy" class="btn btn-sm" type="button" disabled>复制链接</button>
+        <button id="btn-acc-oauth-abort" class="btn btn-ghost btn-sm" type="button" hidden>取消等待</button>
+      </div>
+      <p id="acc-oauth-status" class="status-line" role="status" aria-live="polite"></p>
+      <p id="acc-oauth-error" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <!-- ---- Token 录入面板（原有字段，行为与校验完全不变） ---- -->
+    <div id="acc-token-panel" class="stack" role="tabpanel" aria-labelledby="acc-mode-token" hidden>
+      <label class="field">
+        <span class="label">名称</span>
+        <input id="acc-name" class="input" type="text" maxlength="32" placeholder="例如：主账号" aria-label="账号名称">
+      </label>
+      <label class="field">
+        <span class="label">Token</span>
+        <input id="acc-token" class="input input-mono" type="text" placeholder="粘贴 WorkBuddy token" aria-label="Token">
+        <span id="acc-token-hint" class="hint">编辑时留空表示不修改。token 会明文存放在 KV 中。</span>
+      </label>
+      <label class="field">
+        <span class="label">refresh_token <span class="muted">（可选，强烈建议填）</span></span>
+        <input id="acc-refresh-token" class="input input-mono" type="text" placeholder="粘贴 refresh_token" aria-label="refresh_token">
+        <span id="acc-refresh-hint" class="hint">access_token 是短期凭据、且会被上游轮换（实际有效期看 JWT exp）。填了 refresh_token 才能自动续期，否则失效后只能手动重导。</span>
+      </label>
+      <label class="field">
+        <span class="label">UID <span class="muted">（可选）</span></span>
+        <input id="acc-uid" class="input" type="text" maxlength="64" placeholder="上游用户 ID" aria-label="UID">
+      </label>
+      <label class="field">
+        <span class="label">备注 <span class="muted">（可选）</span></span>
+        <input id="acc-remark" class="input" type="text" maxlength="200" placeholder="备注" aria-label="备注">
+      </label>
+    </div>
+
     <label class="check">
       <input id="acc-enabled" type="checkbox" checked>
       <span>启用（Cron 只签到启用的账号）</span>
@@ -378,7 +401,8 @@
     <p id="dlg-account-error" class="form-error" role="alert" hidden></p>
     <div class="dlg-actions">
       <button id="btn-acc-cancel" class="btn btn-ghost" type="button">取消</button>
-      <button id="btn-acc-save" class="btn btn-primary" type="button">保存</button>
+      <button id="btn-acc-oauth-start" class="btn btn-primary" type="button">授权登录</button>
+      <button id="btn-acc-save" class="btn btn-primary" type="button">保存录入</button>
     </div>
   </form>
 </dialog>
