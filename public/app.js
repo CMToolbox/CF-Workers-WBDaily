@@ -2320,6 +2320,37 @@ async function testCheckin(account) {
 let editingAccountId = null;
 
 /**
+ * 账号弹窗的录入方式与 OAuth 授权会话状态（纯模块局部，不进全局 state：
+ * 它只影响弹窗内部，不参与全量渲染，避免轮询把整个账号列表重绘一遍）。
+ */
+const accountForm = {
+  /** 当前录入方式：'oauth' | 'token' */
+  mode: 'oauth',
+  /** 上游 state（凭据，取消/成功后立刻清空，不写 localStorage） */
+  state: '',
+  /** 授权链接（放只读输入框，供弹窗被拦截时手动复制） */
+  uri: '',
+  /** 轮询间隔（毫秒），取值来自 /api/oauth/start 的 intervalSeconds */
+  intervalMs: 2000,
+  /** 授权会话截止时刻（毫秒）；超时后停止轮询并提示重新生成 */
+  deadlineMs: 0,
+  /** setTimeout 句柄（必须串行，不能 setInterval 叠加请求） */
+  timer: null,
+  /** 会话序号：每次重置 +1，用于丢弃上一轮迟到的响应 */
+  sequence: 0,
+  /** 是否已经成功生成过授权链接（决定主按钮文案） */
+  started: false,
+  /** 连续瞬时失败次数（网络错误 / 上游 5xx）：达到上限才停表，避免一次波动就中断等待 */
+  failures: 0,
+};
+
+/** 授权会话默认有效期与轮询间隔（服务端没给时的兜底，与服务端常量一致）。 */
+const OAUTH_TTL_MS = 600 * 1000;
+const OAUTH_INTERVAL_MS = 2000;
+/** 连续瞬时失败上限：到第 3 次才报错，前两次继续按间隔重试。 */
+const OAUTH_MAX_TRANSIENT_FAILURES = 3;
+
+/**
  * 打开账号弹窗。
  * @param {object|null} account null 表示新增
  */
@@ -2336,8 +2367,375 @@ function openAccountDialog(account) {
   $('#acc-uid').value = account ? account.uid || '' : '';
   $('#acc-remark').value = account ? account.remark || '' : '';
   $('#acc-enabled').checked = account ? account.enabled === true : true;
+  // 每次打开都复位：关掉上一次残留的 state / 定时器 / 授权链接
+  resetOauthFlow();
+  // 编辑已有账号只能是 Token 录入（OAuth 会整组覆盖 token，不能当「编辑」用）
+  const modeSwitch = $('#acc-mode-switch');
+  if (modeSwitch) modeSwitch.hidden = Boolean(account);
+  setAccountMode(account ? 'token' : 'oauth');
   setFormError('#dlg-account-error', '');
   $('#dlg-account').showModal();
+}
+
+// ============ 账号录入方式：OAuth 授权 / Token 录入 ============
+
+/**
+ * 切换录入方式。
+ * - OAuth：隐藏名称/token/refresh/uid/备注与「保存」按钮，只留「取消」（名称由上游资料生成，可后续编辑）；
+ * - Token：显示原有全部字段与「保存」按钮，行为与校验完全不变。
+ * @param {'oauth'|'token'} mode
+ */
+function setAccountMode(mode) {
+  const next = mode === 'token' ? 'token' : 'oauth';
+  accountForm.mode = next;
+  const oauthOn = next === 'oauth';
+
+  const oauthPanel = $('#acc-oauth-panel');
+  const tokenPanel = $('#acc-token-panel');
+  if (oauthPanel) oauthPanel.hidden = !oauthOn;
+  if (tokenPanel) tokenPanel.hidden = oauthOn;
+
+  // 两个标签同时维护 aria-selected（role=tab）与 aria-pressed（按钮语义），读屏两种姿势都能播报
+  for (const [selector, on] of [['#acc-mode-oauth', oauthOn], ['#acc-mode-token', !oauthOn]]) {
+    const btn = $(selector);
+    if (!btn) continue;
+    btn.classList.toggle('is-on', on);
+    btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  // 底部主操作随录入方式切换：OAuth = 授权登录，Token = 保存录入（两者都固定在「取消」右侧）
+  const save = $('#btn-acc-save');
+  if (save) save.hidden = oauthOn;
+  const start = $('#btn-acc-oauth-start');
+  if (start) start.hidden = !oauthOn;
+
+  // 「启用」勾选保留可见：OAuth 新建的账号服务端一律 enabled=true（账号此刻还不存在，无从选择），
+  // 因此这里置灰并复位为勾选，避免用户以为「取消勾选就不启用」；创建后可在账号列表里随时关闭。
+  const enabled = $('#acc-enabled');
+  if (enabled) {
+    enabled.disabled = oauthOn;
+    if (oauthOn) {
+      enabled.checked = true;
+      enabled.title = 'OAuth 授权创建的账号默认启用，可在账号列表里随时关闭';
+    } else {
+      enabled.title = '';
+    }
+  }
+
+  // 切回 Token 录入时把后台轮询停掉，避免两套交互状态同时存在
+  if (!oauthOn) resetOauthFlow();
+  setFormError('#dlg-account-error', '');
+}
+
+/**
+ * tablist 键盘操作：左右方向键在两个标签之间切换（Enter/Space 由 button 原生处理）。
+ * @param {KeyboardEvent} event
+ */
+function onAccountModeKeydown(event) {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  event.preventDefault();
+  const next = accountForm.mode === 'oauth' ? 'token' : 'oauth';
+  setAccountMode(next);
+  const btn = next === 'oauth' ? $('#acc-mode-oauth') : $('#acc-mode-token');
+  if (btn) btn.focus();
+}
+
+/**
+ * 停止轮询（清定时器 + 让上一轮在途请求的响应失效）。
+ */
+function stopOauthPolling() {
+  if (accountForm.timer !== null) {
+    window.clearTimeout(accountForm.timer);
+    accountForm.timer = null;
+  }
+  accountForm.sequence += 1;
+}
+
+/**
+ * 复位授权会话（不清录入方式）：清 state / 链接 / 状态文案 / 按钮态。
+ */
+function resetOauthFlow() {
+  stopOauthPolling();
+  accountForm.state = '';
+  accountForm.uri = '';
+  accountForm.deadlineMs = 0;
+  accountForm.started = false;
+  accountForm.failures = 0;
+
+  const input = $('#acc-oauth-url');
+  if (input) input.value = '';
+  const copy = $('#btn-acc-oauth-copy');
+  if (copy) copy.disabled = true;
+  const start = $('#btn-acc-oauth-start');
+  if (start) {
+    start.disabled = false;
+    start.textContent = '授权登录';
+  }
+  hideOauthAbortButton();
+  setOauthStatus('');
+  setFormError('#acc-oauth-error', '');
+}
+
+/**
+ * 写状态行。
+ * @param {string} text
+ * @param {'idle'|'ok'|'warn'|'bad'} [kind]
+ */
+function setOauthStatus(text, kind = 'idle') {
+  const node = $('#acc-oauth-status');
+  if (!node) return;
+  node.textContent = typeof text === 'string' ? text : '';
+  const classes = ['status-line'];
+  if (kind === 'ok') classes.push('is-ok');
+  else if (kind === 'warn') classes.push('is-warn');
+  else if (kind === 'bad') classes.push('is-bad');
+  node.className = classes.join(' ');
+}
+
+/**
+ * 展示授权流程错误（含错误码，便于对照服务端日志）。
+ * @param {*} err
+ */
+function setOauthError(err) {
+  const code = (err && err.code) || 'INTERNAL';
+  const message = (err && err.message) || '授权失败';
+  setFormError('#acc-oauth-error', `${code}: ${message}`);
+}
+
+/**
+ * 等待态文案（每次轮询都刷新剩余秒数）。
+ */
+function renderOauthWaiting() {
+  const remainSec = Math.max(0, Math.ceil((accountForm.deadlineMs - Date.now()) / 1000));
+  setOauthStatus(`等待授权…（剩余 ${remainSec} 秒）请在弹出的官方页面完成登录，本页会自动检测结果`, 'warn');
+}
+
+/**
+ * 主按钮切到「可重试」态（过期 / 出错后仍能再生成一次）。
+ * 只负责主按钮本身：是否显示「取消等待」由调用方决定（等待中要显示，失败/过期要隐藏）。
+ * @param {string} label
+ */
+function restoreOauthStartButton(label) {
+  const start = $('#btn-acc-oauth-start');
+  if (start) {
+    start.disabled = false;
+    start.textContent = label;
+  }
+}
+
+/**
+ * 隐藏「取消等待」按钮。
+ */
+function hideOauthAbortButton() {
+  const abort = $('#btn-acc-oauth-abort');
+  if (abort) abort.hidden = true;
+}
+
+/**
+ * 申请授权链接：POST /api/oauth/start -> window.open + 开始轮询。
+ * 弹窗可能被浏览器拦截，因此链接同时放进只读输入框 + 提供「复制链接」兜底。
+ */
+async function startOauthLogin() {
+  const button = $('#btn-acc-oauth-start');
+  if (!button || button.disabled) return;
+
+  // 重新生成 = 丢弃上一轮会话，新开一轮（sequence 变化后旧响应会被忽略）
+  stopOauthPolling();
+  accountForm.failures = 0;
+  const runId = accountForm.sequence;
+  button.disabled = true;
+  button.textContent = '正在申请…';
+  setFormError('#acc-oauth-error', '');
+  setOauthStatus('正在向 WorkBuddy 申请授权链接…');
+
+  try {
+    const data = await api('/api/oauth/start', { method: 'POST', body: {} });
+    if (accountForm.sequence !== runId) return;
+    const uri = data && typeof data.verificationUri === 'string' ? data.verificationUri : '';
+    const state = data && typeof data.state === 'string' ? data.state : '';
+    if (!uri || !state) throw new ApiError('BAD_RESPONSE', '服务返回的授权信息不完整', 0);
+
+    const intervalSec = Number(data.intervalSeconds);
+    accountForm.intervalMs = Number.isFinite(intervalSec) && intervalSec > 0
+      ? Math.min(10, Math.max(1, Math.round(intervalSec))) * 1000
+      : OAUTH_INTERVAL_MS;
+    const ttlSec = Number(data.expiresIn);
+    const ttlMs = Number.isFinite(ttlSec) && ttlSec > 0 ? ttlSec * 1000 : OAUTH_TTL_MS;
+
+    accountForm.state = state;
+    accountForm.uri = uri;
+    accountForm.deadlineMs = Date.now() + ttlMs;
+    accountForm.started = true;
+
+    const input = $('#acc-oauth-url');
+    if (input) input.value = uri;
+    const copy = $('#btn-acc-oauth-copy');
+    if (copy) copy.disabled = false;
+    const abort = $('#btn-acc-oauth-abort');
+    if (abort) abort.hidden = false;
+
+    // noopener/noreferrer：绝不把本站 window 句柄交给外部页面。
+    // 副作用是 window.open 恒返回 null，无法据此判断「是否被拦截」，
+    // 所以统一 toast 提示「若未自动打开请复制链接」。
+    window.open(uri, '_blank', 'noopener,noreferrer');
+    toast('已打开授权页；若未自动打开，请复制链接手动访问', 'info');
+
+    renderOauthWaiting();
+    restoreOauthStartButton('重新生成链接');
+    scheduleOauthPoll(runId);
+  } catch (err) {
+    if (accountForm.sequence !== runId) return;
+    accountForm.state = '';
+    accountForm.started = false;
+    setOauthStatus('');
+    setOauthError(err);
+    hideOauthAbortButton();
+    restoreOauthStartButton('授权登录');
+  }
+}
+
+/**
+ * 安排下一次轮询（setTimeout 串行，绝不 setInterval 叠加请求）。
+ * @param {number} runId
+ */
+function scheduleOauthPoll(runId) {
+  if (accountForm.sequence !== runId) return;
+  if (!accountForm.state) return;
+  if (accountForm.deadlineMs > 0 && Date.now() >= accountForm.deadlineMs) {
+    expireOauthFlow('授权已超时，请点击「授权登录」重试');
+    return;
+  }
+  accountForm.timer = window.setTimeout(() => {
+    accountForm.timer = null;
+    void pollOauthOnce(runId);
+  }, accountForm.intervalMs);
+}
+
+/**
+ * 轮询一次授权结果。
+ * @param {number} runId
+ */
+async function pollOauthOnce(runId) {
+  if (accountForm.sequence !== runId) return;
+  const state = accountForm.state;
+  if (!state) return;
+  try {
+    const data = await api(`/api/oauth/poll?state=${encodeURIComponent(state)}`);
+    // 迟到响应：期间用户取消了 / 重新生成了 / 关了弹窗，一律丢弃
+    if (accountForm.sequence !== runId) return;
+    // 拿到正常响应（pending/success/expired）即视为链路恢复，重置瞬时失败计数
+    accountForm.failures = 0;
+    const status = data && typeof data.status === 'string' ? data.status : '';
+    if (status === 'success') {
+      await finishOauthFlow(data && data.account);
+      return;
+    }
+    if (status === 'expired') {
+      expireOauthFlow('授权已失效，请点击「授权登录」重试');
+      return;
+    }
+    renderOauthWaiting();
+    scheduleOauthPoll(runId);
+  } catch (err) {
+    if (accountForm.sequence !== runId) return;
+    // 401 由 api() 统一处理（回登录页），这里只需停表
+    if (err instanceof ApiError && err.status === 401) {
+      stopOauthPolling();
+      accountForm.state = '';
+      return;
+    }
+    // 瞬时故障（网络错误 / 上游 5xx）不立刻打断等待：用户可能正在授权页登录，
+    // 一有波动就停表会让人误以为授权失败。连续失败达到上限才真正报错。
+    const transient = err instanceof ApiError && (err.status === 0 || err.status === 502);
+    if (transient) {
+      accountForm.failures += 1;
+      if (accountForm.failures < OAUTH_MAX_TRANSIENT_FAILURES) {
+        setOauthStatus(
+          `网络波动，正在重试（${accountForm.failures}/${OAUTH_MAX_TRANSIENT_FAILURES}）…`,
+          'warn',
+        );
+        scheduleOauthPoll(runId);
+        return;
+      }
+    }
+    stopOauthPolling();
+    accountForm.state = '';
+    accountForm.started = false;
+    setOauthStatus('');
+    setOauthError(err);
+    hideOauthAbortButton();
+    restoreOauthStartButton('重新生成链接');
+  }
+}
+
+/**
+ * 授权成功：关弹窗 -> toast -> 刷新列表 -> 拉新账号额度。
+ * @param {object|null} account 服务端返回的脱敏账号
+ */
+async function finishOauthFlow(account) {
+  const created = account && typeof account === 'object' ? account : {};
+  stopOauthPolling();
+  accountForm.state = '';
+  accountForm.started = false;
+  setOauthStatus('授权成功，账号已添加', 'ok');
+
+  const dialog = $('#dlg-account');
+  if (dialog && dialog.open) dialog.close();
+  toast('账号已添加', 'ok');
+  await refreshAccounts();
+  if (typeof created.id === 'string' && created.id) {
+    await loadCredits(created.id, { silent: true });
+  }
+}
+
+/**
+ * 授权会话过期（上游 state 失效 或 本地 600 秒超时）。
+ * @param {string} message
+ */
+function expireOauthFlow(message) {
+  stopOauthPolling();
+  accountForm.state = '';
+  accountForm.started = false;
+  setOauthStatus(message, 'warn');
+  hideOauthAbortButton();
+  restoreOauthStartButton('重新生成链接');
+}
+
+/**
+ * 取消等待：只停止轮询并回到未开始态（不调后端取消接口，state 会自然过期）。
+ */
+function abortOauthWait() {
+  stopOauthPolling();
+  accountForm.state = '';
+  accountForm.started = false;
+  accountForm.deadlineMs = 0;
+  hideOauthAbortButton();
+  restoreOauthStartButton('授权登录');
+  setOauthStatus('已取消等待授权', 'idle');
+}
+
+/**
+ * 复制授权链接（弹窗被拦截时的兜底路径）。
+ */
+async function copyOauthUri() {
+  const input = $('#acc-oauth-url');
+  const uri = (input && input.value) || accountForm.uri;
+  if (!uri) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(uri);
+      toast('授权链接已复制', 'ok');
+      return;
+    }
+    throw new Error('clipboard unavailable');
+  } catch {
+    if (input) {
+      input.focus();
+      input.select();
+    }
+    toast('自动复制不可用，请按 Ctrl/Cmd + C 手动复制', 'warn');
+  }
 }
 
 /**
@@ -2856,6 +3254,26 @@ function bindEvents() {
 
   $('#btn-acc-save').addEventListener('click', saveAccount);
   $('#btn-acc-cancel').addEventListener('click', () => $('#dlg-account').close());
+
+  // 账号录入方式切换（按钮原生支持 Enter/Space，方向键额外补充 tablist 习惯）
+  for (const btn of $$('[data-acc-mode]')) {
+    btn.addEventListener('click', () => setAccountMode(btn.dataset.accMode));
+    btn.addEventListener('keydown', onAccountModeKeydown);
+  }
+  $('#btn-acc-oauth-start').addEventListener('click', startOauthLogin);
+  $('#btn-acc-oauth-abort').addEventListener('click', abortOauthWait);
+  $('#btn-acc-oauth-copy').addEventListener('click', copyOauthUri);
+
+  // 弹窗关闭（Esc / 取消 / 点遮罩 / 授权成功）都停掉轮询并复位，避免后台空转
+  $('#dlg-account').addEventListener('close', () => {
+    stopOauthPolling();
+    resetOauthFlow();
+  });
+  // 点遮罩关闭：<dialog> 原生不响应遮罩点击，这里按「点击目标是 dialog 自身」判定
+  $('#dlg-account').addEventListener('click', (event) => {
+    if (event.target === event.currentTarget) event.currentTarget.close();
+  });
+
   $('#btn-confirm-ok').addEventListener('click', async () => {
     const handler = confirmHandler;
     confirmHandler = null;

@@ -26,8 +26,23 @@ export const SUMMARY_PATH = '/billing/meter/get-user-resource-summary';
 export const PAID_PATH = '/billing/meter/get-user-resource-paid-packages';
 export const FREE_PATH = '/billing/meter/get-user-resource-free-packages';
 
+/** OAuth 授权三个端点（src/oauth.js 使用）：申请会话 / 轮询 token / 拉账号资料。 */
+export const OAUTH_STATE_PATH = '/v2/plugin/auth/state';
+export const OAUTH_TOKEN_PATH = '/v2/plugin/auth/token';
+export const OAUTH_ACCOUNT_PATH = '/v2/plugin/login/account';
+
 /** mock 允许的出站端点全集：出现其它路径即视为测试装配错误。 */
-const ALLOWED_PATHS = new Set([STATUS_PATH, DAILY_PATH, REFRESH_PATH, SUMMARY_PATH, PAID_PATH, FREE_PATH]);
+const ALLOWED_PATHS = new Set([
+  STATUS_PATH,
+  DAILY_PATH,
+  REFRESH_PATH,
+  SUMMARY_PATH,
+  PAID_PATH,
+  FREE_PATH,
+  OAUTH_STATE_PATH,
+  OAUTH_TOKEN_PATH,
+  OAUTH_ACCOUNT_PATH,
+]);
 
 /** 站点基址（API 测试用）。 */
 export const SITE_ORIGIN = 'https://wb.example.com';

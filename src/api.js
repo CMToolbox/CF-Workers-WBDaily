@@ -1,12 +1,11 @@
 // src/api.js
-// 22 条 /api/* REST 路由（第 23 个端点 /api/mcp 由 mcp.js 处理）+ 可复用的服务函数（svc*）。
+// 24 条 /api/* REST 路由（第 25 个端点 /api/mcp 由 mcp.js 处理）+ 可复用的服务函数（svc*）。
 // mcp.js 只允许 import 这里的 svc*，不得自己写 KV，避免两套账号/日志逻辑漂移。
 // 约束：不得访问裸 env / 全局 fetch / Date.now()（时间一律 ctx.now()）。
 
 import {
   AppError,
   isoNow,
-  maskToken,
   newAccountId,
   ok,
   randomB64,
@@ -29,9 +28,13 @@ import { runCheckin } from './run.js';
 import { checkinStatus } from './checkin.js';
 import { svcAccountCredits } from './credits.js';
 import { buildCockpitExport, mergeImportedAccounts, normalizeImportPayload } from './account-io.js';
-import { withFreshToken, tokenExpiresAtMs } from './upstream-token.js';
+import { withFreshToken } from './upstream-token.js';
 import { recordProgress } from './progress.js';
-import { normalizeCheckinHour, parseCheckinHour, pickNextCheckinHour } from './schedule.js';
+import { parseCheckinHour, pickNextCheckinHour } from './schedule.js';
+// 账号出参脱敏：抽到 account-view.js，api.js 与 oauth.js 共用（避免两者循环依赖）
+import { maskAccount } from './account-view.js';
+// OAuth 授权登录（服务端代理上游 3 个 /v2/plugin 接口）
+import { pollWorkbuddyLogin, startWorkbuddyLogin } from './oauth.js';
 
 /** 服务版本号（bootstrap 与 MCP serverInfo 保持一致）。 */
 export const VERSION = '1.0.0';
@@ -149,34 +152,6 @@ function normalizePassword(input) {
  */
 function asString(value) {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-/**
- * 账号出参脱敏：只给 tokenMasked，**绝不**返回 token 字段。
- * 额外给两个「token 生命周期」字段，让面板能直接显示「还有多久过期 / 能不能自动续期」：
- *   - tokenExpiresAt：从 JWT exp 解出的过期时刻（解不出为 null）
- *   - hasRefreshToken：是否保存了 refresh_token（决定过期后能否自动续期）
- * @param {object} account
- * @returns {object}
- */
-function maskAccount(account) {
-  const src = account && typeof account === 'object' ? account : {};
-  const token = typeof src.token === 'string' ? src.token : '';
-  const expMs = tokenExpiresAtMs(token);
-  return {
-    id: typeof src.id === 'string' ? src.id : '',
-    name: typeof src.name === 'string' ? src.name : '',
-    tokenMasked: maskToken(token),
-    uid: typeof src.uid === 'string' ? src.uid : '',
-    enabled: src.enabled === true,
-    remark: typeof src.remark === 'string' ? src.remark : '',
-    createdAt: typeof src.createdAt === 'string' ? src.createdAt : '',
-    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
-    tokenExpiresAt: expMs === null ? null : isoNow(expMs),
-    hasRefreshToken: typeof src.refreshToken === 'string' && Boolean(src.refreshToken),
-    // 每账号独立的签到小时（北京时间 0~23），缺失时回落默认 8 点
-    checkinHour: normalizeCheckinHour(src.checkinHour),
-  };
 }
 
 // ===== 服务层（api 与 mcp 共用，全部只经 ctx.kv.* 访问 KV）=====
@@ -698,6 +673,31 @@ async function handleAccountCredits({ ctx, params }) {
 }
 
 /**
+ * POST /api/oauth/start（auth）：申请一次 WorkBuddy OAuth 授权会话。
+ * 只返回 { state, verificationUri, expiresIn, intervalSeconds }：
+ * state 是本次登录的临时凭据（前端拿去轮询），**任何 token 都不出现在响应里**。
+ * 写操作：沿用 handleApi 里的同源校验 + JSON body 机制（前端会带 {}）。
+ * 真正常见的失败是「上游拒绝/超时」，统一映射成 502 UPSTREAM_ERROR。
+ * @param {{ctx:object}} params
+ * @returns {Promise<Response>}
+ */
+async function handleOauthStart({ ctx }) {
+  return ok(await startWorkbuddyLogin(ctx));
+}
+
+/**
+ * GET /api/oauth/poll?state=（auth）：轮询授权结果。
+ * 三种状态：pending（还在等登录）/ expired（state 失效，需重新生成）/ success（已落库，带脱敏账号）。
+ * 「还在等」用返回值表达，不用 4xx/5xx，否则前端没法区分「继续等」和「出错」。
+ * @param {{ctx:object, url:URL}} params
+ * @returns {Promise<Response>}
+ */
+async function handleOauthPoll({ ctx, url }) {
+  const state = url && url.searchParams ? url.searchParams.get('state') : '';
+  return ok(await pollWorkbuddyLogin(ctx, state));
+}
+
+/**
  * POST /api/checkin/run（auth）：全部（或指定）账号签到
  * @param {{ctx:object, body:object}} params
  * @returns {Promise<Response>}
@@ -847,7 +847,7 @@ async function handleRotateMcpKey({ ctx }) {
 }
 
 /**
- * 路由表（19 条；第 20 个端点 /api/mcp 由 mcp.js 处理）。
+ * 路由表（24 条；第 25 个端点 /api/mcp 由 mcp.js 处理）。
  * auth: true 表示需要会话 Cookie。
  * @type {Array<{method:string, pattern:string, handler:Function, auth:boolean}>}
  */
@@ -866,6 +866,9 @@ export const API_ROUTES = [
   { method: 'DELETE', pattern: '/api/accounts/:id', handler: handleDeleteAccount, auth: true },
   { method: 'POST', pattern: '/api/accounts/:id/checkin', handler: handleAccountCheckin, auth: true },
   { method: 'GET', pattern: '/api/accounts/:id/credits', handler: handleAccountCredits, auth: true },
+  // OAuth 授权录入：start 申请会话（写操作，走同源校验），poll 轮询结果
+  { method: 'POST', pattern: '/api/oauth/start', handler: handleOauthStart, auth: true },
+  { method: 'GET', pattern: '/api/oauth/poll', handler: handleOauthPoll, auth: true },
   { method: 'POST', pattern: '/api/checkin/run', handler: handleRunCheckin, auth: true },
   { method: 'GET', pattern: '/api/logs', handler: handleGetLogs, auth: true },
   { method: 'GET', pattern: '/api/logs/:runId', handler: handleGetRun, auth: true },
