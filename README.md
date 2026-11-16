@@ -17,7 +17,7 @@
 
 ## 🚀 一键部署（推荐）
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cmliu/CF-Workers-WBDaily)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/CMToolbox/CF-Workers-WBDaily)
 
 点击上方按钮，按页面提示完成三步：
 
